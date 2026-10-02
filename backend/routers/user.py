@@ -4,7 +4,8 @@ import sys
 import uuid
 import json
 import datetime
-import subprocess
+import tkinter as tk
+from tkinter import filedialog
 from pathlib import Path
 from typing import Optional, List
 from fastapi import APIRouter, Depends, HTTPException
@@ -119,99 +120,39 @@ class MessageResponse(BaseModel):
 
 
 # ==========================================
-# ENDPOINTS DE CONFIGURACIÓN Y ONBOARDING
+# ENDPOINTS DE CONFIGURACIÓN Y ONBOARDING (TKINTER NATIVO)
 # ==========================================
 @router.post("/browse-directory")
 def examinar_directorio_nativo():
-    """Abre el explorador de carpetas nativo mediante un proceso independiente según el SO."""
+    """Abre el explorador de carpetas nativo instantáneamente usando Tkinter."""
     ruta_elegida = ""
-
     try:
-        if sys.platform == "darwin":
-            # Selector nativo de macOS vía AppleScript en System Events
-            script = """
-            tell application "System Events"
-                activate
-                set theFolder to choose folder with prompt "Selecciona la carpeta de normativas de OneDrive:"
-                return POSIX path of theFolder
-            end tell
-            """
-            res = subprocess.run(
-                ["osascript", "-e", script],
-                capture_output=True,
-                text=True,
-                timeout=60
-            )
-            if res.returncode == 0:
-                ruta_elegida = res.stdout.strip()
-
-        elif sys.platform == "win32":
-            # Selector nativo de Windows vía PowerShell FolderBrowserDialog
-            ps_cmd = (
-                "Add-Type -AssemblyName System.Windows.Forms; "
-                "$f = New-Object System.Windows.Forms.FolderBrowserDialog; "
-                "$f.Description = 'Selecciona la carpeta de normativas de OneDrive'; "
-                "if ($f.ShowDialog() -eq 'OK') { Write-Output $f.SelectedPath }"
-            )
-            res = subprocess.run(
-                ["powershell", "-NoProfile", "-Command", ps_cmd],
-                capture_output=True,
-                text=True,
-                timeout=60
-            )
-            if res.returncode == 0:
-                ruta_elegida = res.stdout.strip()
-
+        root = tk.Tk()
+        root.withdraw()  # Oculta la ventana principal de tkinter
+        root.attributes('-topmost', True)  # Forzar al frente
+        ruta_elegida = filedialog.askdirectory(title="Selecciona la carpeta de normativas de OneDrive")
+        root.destroy()
     except Exception as e:
-        print(f"[WARN BROWSE] No se pudo invocar el selector nativo: {e}")
+        print(f"[WARN BROWSE DIR] Error en selector nativo: {e}")
 
     return {"ruta": ruta_elegida}
 
 
 @router.post("/browse-file")
 def examinar_archivo_nativo():
-    """Abre el explorador de archivos nativo (solo para .json) mediante un proceso independiente según el SO."""
+    """Abre el explorador de archivos nativo (.json) instantáneamente usando Tkinter."""
     ruta_elegida = ""
-
     try:
-        if sys.platform == "darwin":
-            # Selector nativo de macOS vía AppleScript
-            script = """
-            tell application "System Events"
-                activate
-                set theFile to choose file with prompt "Selecciona el chat a importar (.json):" of type {"json"}
-                return POSIX path of theFile
-            end tell
-            """
-            res = subprocess.run(
-                ["osascript", "-e", script],
-                capture_output=True,
-                text=True,
-                timeout=60
-            )
-            if res.returncode == 0:
-                ruta_elegida = res.stdout.strip()
-
-        elif sys.platform == "win32":
-            # Selector nativo de Windows vía PowerShell OpenFileDialog
-            ps_cmd = (
-                "Add-Type -AssemblyName System.Windows.Forms; "
-                "$f = New-Object System.Windows.Forms.OpenFileDialog; "
-                "$f.Filter = 'Archivos JSON (*.json)|*.json'; "
-                "$f.Title = 'Selecciona el chat a importar'; "
-                "if ($f.ShowDialog() -eq 'OK') { Write-Output $f.FileName }"
-            )
-            res = subprocess.run(
-                ["powershell", "-NoProfile", "-Command", ps_cmd],
-                capture_output=True,
-                text=True,
-                timeout=60
-            )
-            if res.returncode == 0:
-                ruta_elegida = res.stdout.strip()
-
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes('-topmost', True)
+        ruta_elegida = filedialog.askopenfilename(
+            title="Selecciona el chat a importar",
+            filetypes=[("Archivos JSON", "*.json"), ("Todos los archivos", "*.*")]
+        )
+        root.destroy()
     except Exception as e:
-        print(f"[WARN BROWSE FILE] No se pudo invocar el selector nativo: {e}")
+        print(f"[WARN BROWSE FILE] Error en selector nativo: {e}")
 
     return {"ruta": ruta_elegida}
 
