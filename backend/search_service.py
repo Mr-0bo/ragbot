@@ -1,21 +1,40 @@
-# backend/search_service.py
 from typing import List, Dict, Optional, Union
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
-from fastembed import TextEmbedding
+from fastembed import SparseTextEmbedding
+from fastembed.rerank.cross_encoder import TextCrossEncoder
+from sentence_transformers import SentenceTransformer  # <-- Importamos la oficial
 from backend.config import settings
 
 # Instancias singleton para reutilizar memoria
 _qdrant_client: Optional[QdrantClient] = None
-_embedding_model: Optional[TextEmbedding] = None
+_embedding_model: Optional[SentenceTransformer] = None  # <-- Cambia el tipo
+_sparse_model: Optional[SparseTextEmbedding] = None
+_reranker_model: Optional[TextCrossEncoder] = None
 
 
-def get_embedding_model() -> TextEmbedding:
-    """Carga de forma perezosa el modelo de embeddings local."""
+def get_embedding_model() -> SentenceTransformer:
+    """Carga BAAI/bge-m3 nativamente con SentenceTransformers."""
     global _embedding_model
     if _embedding_model is None:
-        _embedding_model = TextEmbedding(model_name=settings.EMBEDDING_MODEL_NAME)
+        _embedding_model = SentenceTransformer(settings.EMBEDDING_MODEL_NAME)
     return _embedding_model
+
+
+def get_sparse_model() -> SparseTextEmbedding:
+    """Carga de forma perezosa el modelo BM25 (disperso) local."""
+    global _sparse_model
+    if _sparse_model is None:
+        _sparse_model = SparseTextEmbedding(model_name=settings.SPARSE_MODEL_NAME)
+    return _sparse_model
+
+
+def get_reranker_model() -> TextCrossEncoder:
+    """Carga de forma perezosa el modelo Cross-Encoder (Reranker) local en CPU."""
+    global _reranker_model
+    if _reranker_model is None:
+        _reranker_model = TextCrossEncoder(model_name=settings.RERANKER_MODEL_NAME)
+    return _reranker_model
 
 
 def get_qdrant_client() -> QdrantClient:
@@ -28,42 +47,65 @@ def get_qdrant_client() -> QdrantClient:
 
 
 def _inicializar_coleccion(client: QdrantClient):
-    """Crea la colección si no existe."""
+    """Crea la colección si no existe, configurando vectores densos y dispersos (híbrida)."""
     if not client.collection_exists(settings.QDRANT_COLLECTION_NAME):
+        modelo_denso = get_embedding_model()
+        # <-- Adaptado para SentenceTransformer
+        vector_prueba = modelo_denso.encode("prueba").tolist()
+        dimension = len(vector_prueba)
+
         client.create_collection(
             collection_name=settings.QDRANT_COLLECTION_NAME,
-            vectors_config=models.VectorParams(
-                size=settings.EMBEDDING_DIMENSION,
-                distance=models.Distance.COSINE
-            )
+            vectors_config={
+                "dense": models.VectorParams(
+                    size=dimension,
+                    distance=models.Distance.COSINE
+                )
+            },
+            sparse_vectors_config={
+                "sparse": models.SparseVectorParams(
+                    index=models.SparseIndexParams(
+                        on_disk=False,
+                    )
+                )
+            }
         )
-
-
-def generar_embedding_local(texto: str) -> List[float]:
-    """Genera vector de 384 dimensiones en CPU local."""
-    modelo = get_embedding_model()
-    vectores = list(modelo.embed([texto]))
-    return vectores[0].tolist()
 
 
 def buscar_fragmentos(
         consultas: Union[str, List[str]],
+        consulta_referencia: Optional[str] = None,
         region: str = "mexico",
-        top_k: int = 10,
+        top_k: int = 6,
+        recall_k: int = 25,
         max_por_doc: int = 3,
         max_por_pagina: int = 2
 ) -> List[Dict]:
     """
-    Busca semánticamente en Qdrant con distribución equitativa por subconsulta (Round-Robin)
-    y diversificación estricta por documento y página.
+    Pipeline bi-etápico de recuperación:
+    1. Fase Híbrida: BGE-M3 + BM25 con RRF en Qdrant (obtiene candidatos amplios).
+    2. Fase Cross-Encoder: BGE-Reranker-Base clasifica (consulta_referencia, contenido)
+       y retorna los top_k más relevantes.
     """
     try:
         client = get_qdrant_client()
+        modelo_denso = get_embedding_model()
+        modelo_disperso = get_sparse_model()
 
         if isinstance(consultas, str):
             lista_consultas = [consultas]
         else:
             lista_consultas = consultas if consultas else [""]
+
+        subconsultas_validas = [q.strip() for q in lista_consultas if q.strip()]
+        if not subconsultas_validas:
+            return []
+
+        # Determinar consulta base para el reranking
+        query_rerank = (consulta_referencia or subconsultas_validas[0]).strip()
+
+        print(f"\n[DEBUG SEARCH] Subconsultas recibidas ({len(subconsultas_validas)}): {subconsultas_validas}")
+        print(f"[DEBUG SEARCH] Consulta de referencia para Reranker: '{query_rerank}'")
 
         filtro_region = models.Filter(
             must=[
@@ -74,99 +116,104 @@ def buscar_fragmentos(
             ]
         )
 
-        # 1. Recuperar y filtrar candidatos por cada subconsulta (recall amplio a 40)
-        puntos_por_consulta = []
-        print(f"\n[DEBUG SEARCH] Subconsultas recibidas ({len(lista_consultas)}): {lista_consultas}")
+        # 1. Recuperación amplia con prefetches consolidados (Dense + Sparse)
+        prefetches: List[models.Prefetch] = []
+        for sub_query in subconsultas_validas:
+            # <-- Adaptado a SentenceTransformer
+            vector_denso = modelo_denso.encode(sub_query).tolist()
+            vector_disperso = list(modelo_disperso.embed([sub_query]))[0]
 
-        for idx, sub_query in enumerate(lista_consultas):
-            sub_query_limpia = sub_query.strip()
-            if not sub_query_limpia:
-                continue
-
-            print(f"[DEBUG SEARCH] Ejecutando subconsulta {idx + 1}/{len(lista_consultas)}: '{sub_query_limpia}'")
-            vector_query = generar_embedding_local(sub_query_limpia)
-            respuesta = client.query_points(
-                collection_name=settings.QDRANT_COLLECTION_NAME,
-                query=vector_query,
-                query_filter=filtro_region,
-                limit=40,
-                with_payload=True
+            prefetches.append(
+                models.Prefetch(
+                    query=vector_denso,
+                    using="dense",
+                    limit=recall_k * 2,
+                    filter=filtro_region
+                )
+            )
+            prefetches.append(
+                models.Prefetch(
+                    query=models.SparseVector(
+                        indices=vector_disperso.indices.tolist(),
+                        values=vector_disperso.values.tolist()
+                    ),
+                    using="sparse",
+                    limit=recall_k * 2,
+                    filter=filtro_region
+                )
             )
 
-            # Pre-deduplicar respetando max_por_pagina para no descartar chunks hermanos de páginas densas
-            pts_filtrados = []
-            conteo_paginas_subquery: Dict[str, int] = {}
-            for p in sorted(respuesta.points, key=lambda x: float(x.score), reverse=True):
-                pl = p.payload or {}
-                # Casteo a string obligatorio para evitar errores de tipo int vs str
-                doc_str = str(pl.get('documento', 'Desconocido'))
-                pag_str = str(pl.get('pagina', 'N/A'))
-                clave = f"{doc_str}_{pag_str}"
+        # Fusión RRF en Qdrant
+        respuesta = client.query_points(
+            collection_name=settings.QDRANT_COLLECTION_NAME,
+            prefetch=prefetches,
+            query=models.FusionQuery(fusion=models.Fusion.RRF),
+            query_filter=filtro_region,
+            limit=recall_k * 2,
+            with_payload=True
+        )
 
-                if conteo_paginas_subquery.get(clave, 0) < max_por_pagina:
-                    conteo_paginas_subquery[clave] = conteo_paginas_subquery.get(clave, 0) + 1
-                    pts_filtrados.append(p)
+        puntos_fusionados = respuesta.points or []
+        print(f"[DEBUG SEARCH] Candidatos unificados tras RRF (Fase 1): {len(puntos_fusionados)}")
 
-            print(
-                f"[DEBUG SEARCH] -> Puntos recuperados para subconsulta {idx + 1} (máx {max_por_pagina} por pág): {len(pts_filtrados)}")
-            puntos_por_consulta.append(pts_filtrados)
+        if not puntos_fusionados:
+            return []
 
-        # 2. Mezcla Round-Robin: garantizar representación de cada subconsulta
-        candidatos_intercalados = []
-        max_longitud = max((len(pts) for pts in puntos_por_consulta), default=0)
-        for i in range(max_longitud):
-            for pts in puntos_por_consulta:
-                if i < len(pts):
-                    candidatos_intercalados.append(pts[i])
-
-        print(f"[DEBUG SEARCH] Total candidatos intercalados pre-filtro final: {len(candidatos_intercalados)}")
-
-        # 3. Diversificación y deduplicación global final
-        conteo_doc: Dict[str, int] = {}
-        conteo_pagina: Dict[str, int] = {}
+        # 2. Filtrado inicial por documento/página para la bolsa de candidatos del Reranker
+        candidatos_rerank = []
+        conteo_doc_pre: Dict[str, int] = {}
+        conteo_pag_pre: Dict[str, int] = {}
         ids_vistos = set()
-        fragmentos_diversificados = []
 
-        print(f"\n--- [EVALUACIÓN QDRANT LOCAL ({region.upper()})] ---")
-        for punto in candidatos_intercalados:
-            if punto.id in ids_vistos:
+        for p in puntos_fusionados:
+            if p.id in ids_vistos:
                 continue
 
-            payload = punto.payload or {}
-            # Casteo a string obligatorio para el conteo global
-            doc = str(payload.get("documento", "Desconocido"))
-            pag = str(payload.get("pagina", "N/A"))
-            score = float(punto.score)
-
+            pl = p.payload or {}
+            doc = str(pl.get("documento", "Desconocido"))
+            pag = str(pl.get("pagina", "N/A"))
             clave_pag = f"{doc}_{pag}"
 
-            if conteo_pagina.get(clave_pag, 0) >= max_por_pagina:
+            if conteo_pag_pre.get(clave_pag, 0) >= max_por_pagina:
+                continue
+            if conteo_doc_pre.get(doc, 0) >= max_por_doc:
                 continue
 
-            if conteo_doc.get(doc, 0) >= max_por_doc:
-                continue
+            ids_vistos.add(p.id)
+            conteo_pag_pre[clave_pag] = conteo_pag_pre.get(clave_pag, 0) + 1
+            conteo_doc_pre[doc] = conteo_doc_pre.get(doc, 0) + 1
 
-            ids_vistos.add(punto.id)
-            conteo_pagina[clave_pag] = conteo_pagina.get(clave_pag, 0) + 1
-            conteo_doc[doc] = conteo_doc.get(doc, 0) + 1
-
-            print(f"Doc: {doc} | Pág: {pag} | Similitud: {score:.4f}")
-            fragmentos_diversificados.append({
+            candidatos_rerank.append({
                 "documento": doc,
-                "ruta_relativa": payload.get("ruta_relativa", ""),
-                "pagina": payload.get("pagina", "N/A"),
-                "contenido": payload.get("contenido", ""),
-                "region": payload.get("region", region),
-                "score": score
+                "ruta_relativa": pl.get("ruta_relativa", ""),
+                "pagina": pl.get("pagina", "N/A"),
+                "contenido": pl.get("contenido", ""),
+                "region": pl.get("region", region),
+                "score_rrf": float(p.score)
             })
 
-            if len(fragmentos_diversificados) >= top_k:
+            if len(candidatos_rerank) >= recall_k:
                 break
 
-        return fragmentos_diversificados
+        # 3. Fase 2: Reranking con Cross-Encoder local en CPU
+        reranker = get_reranker_model()
+        textos_candidatos = [c["contenido"] for c in candidatos_rerank]
+        scores_rerank = list(reranker.rerank(query_rerank, textos_candidatos))
+
+        for candidato, score_r in zip(candidatos_rerank, scores_rerank):
+            candidato["score"] = float(score_r)
+
+        candidatos_ordenados = sorted(candidatos_rerank, key=lambda x: x["score"], reverse=True)
+
+        print(f"\n--- [EVALUACIÓN POST-RERANKING ({region.upper()})] ---")
+        fragmentos_finales = candidatos_ordenados[:top_k]
+        for f in fragmentos_finales:
+            print(f"Doc: {f['documento']} | Pág: {f['pagina']} | Score Reranker: {f['score']:.4f} (RRF previo: {f['score_rrf']:.4f})")
+
+        return fragmentos_finales
 
     except Exception as e:
-        print(f"[ERROR BÚSQUEDA QDRANT LOCAL] {e}")
+        print(f"[ERROR BÚSQUEDA QDRANT + RERANKER] {e}")
         return []
 
 

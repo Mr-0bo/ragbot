@@ -1,4 +1,3 @@
-# backend/config.py
 import os
 import sys
 from pathlib import Path
@@ -28,9 +27,11 @@ class Settings(BaseSettings):
     def GEMINI_MODEL(self) -> str:
         return self.GEMINI_MODEL_SYNTHESIS
 
-    # Configuración de Embeddings Locales (FastEmbed en CPU)
-    EMBEDDING_MODEL_NAME: str = "BAAI/bge-small-en-v1.5"
-    EMBEDDING_DIMENSION: int = 384
+    # Configuración de Embeddings Multilingües, Sparse y Reranker (FastEmbed en CPU)
+    EMBEDDING_MODEL_NAME: str = "BAAI/bge-m3"
+    SPARSE_MODEL_NAME: str = "Qdrant/bm25"
+    RERANKER_MODEL_NAME: str = "BAAI/bge-reranker-base"
+    # La dimensión (1024 para bge-m3) se autodetecta dinámicamente en search_service.py
 
     # Rutas de almacenamiento local de usuario (No requieren permisos de Administrador)
     APP_NAME: str = "CopilotoNormativas"

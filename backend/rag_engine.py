@@ -1,4 +1,3 @@
-# backend/rag_engine.py
 import re
 import uuid
 import json
@@ -18,17 +17,18 @@ from backend.prompts import (
     generar_prompt_conversacional
 )
 
-# Umbral de corte para similitud coseno en Qdrant con BGE-small
-UMBRAL_SIMILITUD_MINIMO = 0.40
+# Umbral de corte ajustado para el Cross-Encoder (Reranker)
+UMBRAL_SIMILITUD_MINIMO = 0.0
 
 
 def extraer_fuentes_citadas(texto_respuesta: str) -> List[str]:
     """
     Busca patrones de citación en el texto generado como:
-    [Diodos.pdf, Pág. 3] o [Diodos.pdf]
+    [Norma_Tecnica.pdf, Pág. 3] o [Especificacion.pdf]
     Devuelve las citas preservando el formato de corchetes, orden y sin duplicados.
+    Se flexibiliza la expresión regular para tolerar espacios opcionales.
     """
-    patron = r'\[([^\]]+\.pdf(?:,\s*Pág\.\s*\d+)?)\]'
+    patron = r'\[([^\]]+\.pdf(?:\s*,\s*Pág\.\s*\d+)?)\]'
     coincidencias = re.findall(patron, texto_respuesta, re.IGNORECASE)
 
     citas_unicas = []
@@ -42,10 +42,12 @@ def extraer_fuentes_citadas(texto_respuesta: str) -> List[str]:
 
 def ejecutar_consulta(user_id: str, session_id: str, pregunta: str, db: Session) -> dict:
     """
-    Pipeline RAG optimizado con desacoplamiento de modelos:
-    - Clasificación de intención 100% local en CPU (BGE-small + reglas).
+    Pipeline RAG optimizado con dos etapas de recuperación:
+    - Clasificación de intención local en CPU.
     - Reformulación y descomposición de subconsultas vía Gemini 3.1 Flash Lite.
-    - Búsqueda semántica diversificada en Qdrant (top_k=10, deduplicación de páginas y control por doc).
+    - Retrieval Híbrido en Qdrant (Dense BGE-M3 + BM25 con RRF, recall_k=25).
+    - Reranking semántico local vía BGE-Reranker-Base (top_k=6).
+    - Encapsulado de contexto en bloques XML.
     - Síntesis técnica y citas normativas con Gemini 3.5 Flash Lite.
     """
     # 1. Validar existencia de usuario y sesión
@@ -105,28 +107,29 @@ def ejecutar_consulta(user_id: str, session_id: str, pregunta: str, db: Session)
         subconsultas = reformular_pregunta_con_historial(historial_lista, pregunta)
         print(f"[REFORMULACIÓN / DESGLOSE (3.1-FLASH-LITE)] -> {subconsultas}")
 
-        # Búsqueda semántica en Qdrant con diversificación ampliada
-        # max_por_doc=3 y max_por_pagina=2 evitan que páginas ricas en contenido
-        # compitan consigo mismas y sean excluidas prematuramente.
+        # Búsqueda híbrida (BGE-M3 + BM25 con RRF) + Reranking (BGE-Reranker-Base)
         todos_los_fragmentos = buscar_fragmentos(
             consultas=subconsultas,
+            consulta_referencia=pregunta,
             region=region_activa,
-            top_k=10,
+            top_k=6,
+            recall_k=25,
             max_por_doc=3,
             max_por_pagina=2
         )
 
         fragmentos_validos = [f for f in todos_los_fragmentos if f.get("score", 0.0) >= UMBRAL_SIMILITUD_MINIMO]
-        print(f"Fragmentos sobre umbral ({UMBRAL_SIMILITUD_MINIMO}): {len(fragmentos_validos)}/{len(todos_los_fragmentos)}")
+        print(f"Fragmentos sobre umbral Reranker ({UMBRAL_SIMILITUD_MINIMO}): {len(fragmentos_validos)}/{len(todos_los_fragmentos)}")
 
         # Monitoreo detallado del contexto documental entregado
         print("\n" + "=" * 65)
-        print(f"[RAG ENGINE] FRAGMENTOS ENVIADOS A GEMINI 3.5 ({len(fragmentos_validos)}):")
+        print(f"[RAG ENGINE] FRAGMENTOS ENVIADOS A GEMINI 3.5 (XML) ({len(fragmentos_validos)}):")
         for idx, f in enumerate(fragmentos_validos):
-            print(f" [{idx + 1}] {f.get('documento')} | Pág: {f.get('pagina')} | Score: {f.get('score', 0):.4f}")
+            print(f" [{idx + 1}] {f.get('documento')} | Pág: {f.get('pagina')} | Score Reranker: {f.get('score', 0):.4f}")
         print("=" * 65 + "\n")
 
         if fragmentos_validos:
+            # Construcción de prompt con validación XML estricta
             prompt_usuario = generar_prompt_consulta(pregunta, fragmentos_validos)
 
             # Generación técnica con Gemini 3.5 Flash Lite
@@ -136,10 +139,8 @@ def ejecutar_consulta(user_id: str, session_id: str, pregunta: str, db: Session)
                 historial=historial_lista
             )
 
-            # Extraer las citas explícitas que el modelo generó en su texto
             fuentes_unicas = extraer_fuentes_citadas(respuesta_texto)
 
-            # Si el modelo respondió usando el contexto pero omitió los corchetes
             if not fuentes_unicas:
                 indicadores_negativos_totales = [
                     "no se encuentra disponible en los documentos",
@@ -148,9 +149,10 @@ def ejecutar_consulta(user_id: str, session_id: str, pregunta: str, db: Session)
                 ]
                 resp_low = respuesta_texto.lower()
                 if not any(ind in resp_low for ind in indicadores_negativos_totales):
+                    # Fallback basado en los atributos de los fragmentos pasados en el XML
                     fuentes_unicas = list({f"[{f['documento']}, Pág. {f['pagina']}]" for f in fragmentos_validos})
         else:
-            print("\n[AVISO] No se superó el umbral documental.\n")
+            print("\n[AVISO] No se superó el umbral documental post-reranking.\n")
             prompt_usuario = (
                 f"El colaborador consulta: '{pregunta}'. "
                 "Esta información técnica específica no se encuentra en los documentos indexados para la región seleccionada. "

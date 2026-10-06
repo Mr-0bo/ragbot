@@ -1,28 +1,39 @@
-# Servidor Web y API
-fastapi>=0.111.0
-uvicorn[standard]>=0.30.0
-pydantic>=2.7.0
-pydantic-settings>=2.2.0
+# ==========================================
+# 🚀 FRAMEWORK WEB Y SERVIDOR
+# ==========================================
+fastapi
+uvicorn
+pydantic
+pydantic-settings
 
-# Base de datos ORM y Persistencia (SQLite)
-sqlalchemy>=2.0.0
-platformdirs>=4.2.0
+# ==========================================
+# 🗄️ BASE DE DATOS Y ORM (METADATOS)
+# ==========================================
+SQLAlchemy
 
-# LLM en la Nube (Google Gemini - SDK Oficial)
-google-genai>=0.1.1
+# ==========================================
+# 🧠 INTELIGENCIA ARTIFICIAL Y LLMs
+# ==========================================
+google-genai
 
-# Base de Datos Vectorial Local y Embeddings
-qdrant-client>=1.9.0
-fastembed>=0.3.0
-numpy>=1.26.0
+# ==========================================
+# 🔍 BASE DE DATOS VECTORIAL Y EMBEDDINGS
+# ==========================================
+qdrant-client
+fastembed
 
+# ==========================================
+# 📄 PROCESAMIENTO DE DOCUMENTOS (PDF Y OCR)
+# ==========================================
+pymupdf
+paddleocr
+paddlepaddle
+pillow
+sentence-transformers
 
-# Extracción de Documentos
-PyMuPDF>=1.24.0
-
-# OCR de Respaldo (Opcional - Activar solo si procesas escaneos físicos no digitalizados)
-paddleocr>=2.7.0
-paddlepaddle>=2.6.0
-
-# Utilidades y Variables de Entorno
-python-dotenv>=1.0.0
+# ==========================================
+# 🛠️ UTILIDADES DEL SISTEMA
+# ==========================================
+python-dotenv
+platformdirs
+matplotlib

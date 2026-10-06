@@ -1,4 +1,7 @@
 # main.py
+import matplotlib
+matplotlib.use("Agg")  # Fuerza modo headless para evitar errores de NSWindow en macOS
+
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse

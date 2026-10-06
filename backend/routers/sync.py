@@ -8,14 +8,16 @@ from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from qdrant_client.http import models
-import fitz  # PyMuPDF
 
 from backend.database import get_db, SessionLocal, ConfiguracionApp, DocumentoNormativo
 from backend.search_service import (
     get_embedding_model,
+    get_sparse_model,
     indexar_chunks_documento,
     eliminar_documento_por_ruta
 )
+from ingestion.document_parser import extraer_markdown_de_pdf
+from ingestion.ingest_docs import limpiar_texto, dividir_en_chunks
 
 router = APIRouter(prefix="/api/sync", tags=["Sincronización"])
 
@@ -85,7 +87,10 @@ def verificar_cambios_pendientes(db: Session = Depends(get_db)):
 
 
 def procesar_e_indexar_pdf(archivo: Path, region: str, db: Session):
-    """Extrae texto con PyMuPDF, genera vectores y almacena en SQLite + Qdrant."""
+    """
+    Extrae contenido preservando tablas Markdown y fallback a PaddleOCR,
+    segmenta con Recursive Character Splitter, vectoriza (BGE-M3 + BM25) y persiste.
+    """
     ruta_abs = str(archivo.resolve())
     nombre = archivo.name
     hash_actual = calcular_hash_archivo(archivo)
@@ -100,50 +105,76 @@ def procesar_e_indexar_pdf(archivo: Path, region: str, db: Session):
     # Limpiar vectores previos en Qdrant por ruta antes de re-indexar
     eliminar_documento_por_ruta(ruta_abs)
 
-    doc_fitz = fitz.open(archivo)
-    total_paginas = len(doc_fitz)
-    modelo = get_embedding_model()
+    # Extracción unificada con soporte de tablas Markdown y PaddleOCR
+    paginas = extraer_markdown_de_pdf(archivo)
+    total_paginas = len(paginas)
 
-    puntos_qdrant = []
+    modelo_denso = get_embedding_model()
+    modelo_disperso = get_sparse_model()
+
+    textos_chunk = []
+    metadatos_chunk = []
     chunk_index = 0
 
-    for num_pag in range(total_paginas):
-        pagina = doc_fitz[num_pag]
-        texto = pagina.get_text("text").strip()
+    for item in paginas:
+        num_pag = item["pagina"]
+        texto_limpio = limpiar_texto(item["texto"])
+        chunks = dividir_en_chunks(texto_limpio, chunk_size=1200, overlap=200)
 
-        if not texto:
-            continue
-
-        # Segmentación en bloques de ~1000 caracteres con solapamiento
-        sub_chunks = [texto[i:i + 1000] for i in range(0, len(texto), 850)]
-
-        for sub_chunk in sub_chunks:
-            chunk_limpio = sub_chunk.strip()
-            if len(chunk_limpio) < 20:
+        for sub_idx, chunk in enumerate(chunks):
+            if len(chunk) < 20:
                 continue
 
-            vector = list(modelo.embed([chunk_limpio]))[0].tolist()
+            chunk_index += 1
+            textos_chunk.append(chunk)
+            metadatos_chunk.append({
+                "pagina": num_pag,
+                "sub_idx": sub_idx,
+                "texto": chunk
+            })
 
+    if textos_chunk:
+        # Inferencia por lotes para control de memoria RAM
+        lote_size = 32
+        v_densos = []
+        v_dispersos = []
+
+        for b in range(0, len(textos_chunk), lote_size):
+            sub_lote = textos_chunk[b: b + lote_size]
+            # Usar encode de SentenceTransformer para BGE-M3
+            vectores_lote = modelo_denso.encode(sub_lote)
+            v_densos.extend(vectores_lote)
+            v_dispersos.extend(list(modelo_disperso.embed(sub_lote)))
+
+        puntos_qdrant = []
+        for meta, vd, vs in zip(metadatos_chunk, v_densos, v_dispersos):
+            point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{ruta_abs}_{meta['pagina']}_{meta['sub_idx']}"))
+
+            # Asegurar formato lista float nativa
+            dense_vector = vd.tolist() if hasattr(vd, "tolist") else list(vd)
+
+            vector_hibrido = {
+                "dense": dense_vector,
+                "sparse": models.SparseVector(
+                    indices=vs.indices.tolist(),
+                    values=vs.values.tolist()
+                )
+            }
             puntos_qdrant.append(
                 models.PointStruct(
-                    id=str(uuid.uuid4()),
-                    vector=vector,
+                    id=point_id,
+                    vector=vector_hibrido,
                     payload={
                         "documento": nombre,
-                        "ruta_relativa": ruta_abs,  # Usamos ruta_abs para unicidad estricta al borrar
+                        "ruta_relativa": ruta_abs,
                         "ruta_absoluta": ruta_abs,
-                        "pagina": num_pag + 1,
-                        "contenido": chunk_limpio,
+                        "pagina": meta["pagina"],
+                        "contenido": meta["texto"],
                         "region": region.lower()
                     }
                 )
             )
-            chunk_index += 1
 
-    doc_fitz.close()
-
-    # Guardar vectores en Qdrant
-    if puntos_qdrant:
         indexar_chunks_documento(puntos_qdrant)
 
     # Actualizar registro en SQLite

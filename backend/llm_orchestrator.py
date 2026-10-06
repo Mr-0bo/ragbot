@@ -1,4 +1,3 @@
-# backend/llm_orchestrator.py
 import re
 import numpy as np
 from typing import List, Dict, Optional
@@ -41,18 +40,25 @@ def get_gemini_client() -> genai.Client:
 
 
 def _get_vectores_conversacionales():
-    """Carga y almacena en caché los embeddings de las frases de cortesía."""
+    """Carga y almacena en caché los embeddings normalizados de las frases de cortesía."""
     global _VECTORES_CONV_REF
     if _VECTORES_CONV_REF is None:
         modelo = get_embedding_model()
-        _VECTORES_CONV_REF = [list(modelo.embed([f]))[0] for f in _FRASES_CONVERSACIONALES_REF]
+        vectores = []
+        for frase in _FRASES_CONVERSACIONALES_REF:
+            vec = np.array(list(modelo.embed([frase]))[0], dtype=np.float32)
+            norm = np.linalg.norm(vec)
+            if norm > 0:
+                vec = vec / norm
+            vectores.append(vec)
+        _VECTORES_CONV_REF = vectores
     return _VECTORES_CONV_REF
 
 
 def clasificar_intencion(mensaje: str) -> str:
     """
     Clasifica 100% en local si la intención es CONVERSACIONAL o TECNICA,
-    combinando depuración de cortesías y similitud semántica con BGE-small.
+    combinando depuración de cortesías y similitud semántica con BGE-M3.
     """
     msg_limpio = mensaje.strip().lower()
     if not msg_limpio:
@@ -71,20 +77,21 @@ def clasificar_intencion(mensaje: str) -> str:
     if len(palabras_residuo) >= 4:
         return "TECNICA"
 
-    # 2. Evaluación semántica con BGE-small para frases cortas (1 a 3 palabras remanentes)
+    # 2. Evaluación semántica con BGE-M3 para frases cortas (1 a 3 palabras remanentes)
     try:
         modelo = get_embedding_model()
-        vec_pregunta = list(modelo.embed([msg_limpio]))[0]
-        vectores_ref = _get_vectores_conversacionales()
+        vec_raw = np.array(list(modelo.embed([msg_limpio]))[0], dtype=np.float32)
+        norm_pregunta = np.linalg.norm(vec_raw)
 
-        norm_pregunta = np.linalg.norm(vec_pregunta)
-        max_sim = max(
-            float(np.dot(vec_pregunta, v) / (norm_pregunta * np.linalg.norm(v)))
-            for v in vectores_ref
-        )
+        if norm_pregunta > 0:
+            vec_pregunta = vec_raw / norm_pregunta
+            vectores_ref = _get_vectores_conversacionales()
 
-        if max_sim >= 0.70:
-            return "CONVERSACIONAL"
+            # Producto punto sobre vectores unitarios = similitud coseno directa
+            max_sim = max(float(np.dot(vec_pregunta, v)) for v in vectores_ref)
+
+            if max_sim >= 0.65:
+                return "CONVERSACIONAL"
     except Exception as e:
         print(f"[WARN CLASIFICADOR LOCAL] Error al calcular similitud semántica: {e}")
 

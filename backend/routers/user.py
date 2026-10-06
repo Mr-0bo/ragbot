@@ -12,6 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 from sqlalchemy import case
+import multiprocessing
 
 from backend.database import get_db, Usuario, SesionChat, Mensaje, ConfiguracionApp
 
@@ -44,6 +45,7 @@ def obtener_rutas_onedrive_sistema() -> List[Path]:
             rutas.append(d.resolve())
 
     return rutas
+
 
 def validar_carpeta_onedrive(ruta_str: str) -> Path:
     """Verifica que la ruta exista y sea un directorio (permite cualquier carpeta local)."""
@@ -120,40 +122,62 @@ class MessageResponse(BaseModel):
 
 
 # ==========================================
-# ENDPOINTS DE CONFIGURACIÓN Y ONBOARDING (TKINTER NATIVO)
+# ENDPOINTS DE CONFIGURACIÓN Y ONBOARDING (TKINTER EN SUBPROCESO AISLADO)
 # ==========================================
-@router.post("/browse-directory")
-def examinar_directorio_nativo():
-    """Abre el explorador de carpetas nativo instantáneamente usando Tkinter."""
-    ruta_elegida = ""
+def _abrir_selector_carpeta(cola_resultado: multiprocessing.Queue):
+    """Ejecuta el selector de carpeta en un proceso aislado para cumplir con las reglas de macOS."""
     try:
         root = tk.Tk()
-        root.withdraw()  # Oculta la ventana principal de tkinter
-        root.attributes('-topmost', True)  # Forzar al frente
-        ruta_elegida = filedialog.askdirectory(title="Selecciona la carpeta de normativas de OneDrive")
+        root.withdraw()
+        root.attributes('-topmost', True)
+        root.after(1, lambda: root.focus_force())
+        ruta = filedialog.askdirectory(title="Selecciona la carpeta de normativas de OneDrive")
         root.destroy()
+        cola_resultado.put(ruta if ruta else "")
     except Exception as e:
-        print(f"[WARN BROWSE DIR] Error en selector nativo: {e}")
+        print(f"[ERROR BROWSE DIR] {e}")
+        cola_resultado.put("")
 
+
+def _abrir_selector_archivo(cola_resultado: multiprocessing.Queue):
+    """Ejecuta el selector de archivo en un proceso aislado para cumplir con las reglas de macOS."""
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes('-topmost', True)
+        root.after(1, lambda: root.focus_force())
+        ruta = filedialog.askopenfilename(
+            title="Selecciona el chat a importar",
+            filetypes=[("Archivos JSON", "*.json"), ("Todos los archivos", "*.*")]
+        )
+        root.destroy()
+        cola_resultado.put(ruta if ruta else "")
+    except Exception as e:
+        print(f"[ERROR BROWSE FILE] {e}")
+        cola_resultado.put("")
+
+
+@router.post("/browse-directory")
+def examinar_directorio_nativo():
+    """Lanza el selector de carpetas en un proceso separado para evitar el bloqueo de hilo principal en macOS."""
+    cola = multiprocessing.Queue()
+    proceso = multiprocessing.Process(target=_abrir_selector_carpeta, args=(cola,))
+    proceso.start()
+    proceso.join()
+
+    ruta_elegida = cola.get() if not cola.empty() else ""
     return {"ruta": ruta_elegida}
 
 
 @router.post("/browse-file")
 def examinar_archivo_nativo():
-    """Abre el explorador de archivos nativo (.json) instantáneamente usando Tkinter."""
-    ruta_elegida = ""
-    try:
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes('-topmost', True)
-        ruta_elegida = filedialog.askopenfilename(
-            title="Selecciona el chat a importar",
-            filetypes=[("Archivos JSON", "*.json"), ("Todos los archivos", "*.*")]
-        )
-        root.destroy()
-    except Exception as e:
-        print(f"[WARN BROWSE FILE] Error en selector nativo: {e}")
+    """Lanza el selector de archivos en un proceso separado para evitar el bloqueo de hilo principal en macOS."""
+    cola = multiprocessing.Queue()
+    proceso = multiprocessing.Process(target=_abrir_selector_archivo, args=(cola,))
+    proceso.start()
+    proceso.join()
 
+    ruta_elegida = cola.get() if not cola.empty() else ""
     return {"ruta": ruta_elegida}
 
 
