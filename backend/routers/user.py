@@ -120,102 +120,64 @@ class MessageResponse(BaseModel):
 
 
 # ==========================================
-# SELECTORES NATIVOS DEL SISTEMA OPERATIVO
+# SELECTORES ROBUSTOS AISLADOS CON TKINTER
 # ==========================================
-def _abrir_dialogo_macos(es_directorio: bool = True, filtro_json: bool = False) -> str:
+def _ejecutar_tkinter_aislado(codigo_script: str) -> str:
     """
-    Abre el diálogo nativo de macOS forzando foco de ventana vía System Events.
-    Aparece de forma inmediata al frente de la pantalla.
+    Ejecuta un script mínimo de Tkinter en un subproceso de Python limpio.
+    - Cumple la regla de macOS: corre en el main thread de su propio proceso.
+    - Cumple la regla de Windows: no depende de PowerShell ni arrastra todo el backend.
     """
-    if es_directorio:
-        script = (
-            'tell application "System Events"\n'
-            '   activate\n'
-            '   set ruta to choose folder with prompt "Selecciona la carpeta de normativas"\n'
-            '   return POSIX path of ruta\n'
-            'end tell'
-        )
-    else:
-        tipo = '{"public.json"}' if filtro_json else '{"public.item"}'
-        script = (
-            'tell application "System Events"\n'
-            '   activate\n'
-            f'   set ruta to choose file of type {tipo} with prompt "Selecciona el archivo"\n'
-            '   return POSIX path of ruta\n'
-            'end tell'
-        )
-
     try:
+        flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
         resultado = subprocess.run(
-            ["osascript", "-e", script],
+            [sys.executable, "-c", codigo_script],
             capture_output=True,
             text=True,
-            check=True
-        )
-        return resultado.stdout.strip()
-    except subprocess.CalledProcessError:
-        # El usuario canceló la selección
-        return ""
-    except Exception as e:
-        print(f"[WARN SELECTOR MACOS] {e}")
-        return ""
-
-
-def _abrir_dialogo_windows(es_directorio: bool = True, filtro_json: bool = False) -> str:
-    """
-    Abre el diálogo nativo de Windows vía PowerShell sin instanciar librerías pesadas de Python.
-    """
-    if es_directorio:
-        cmd = (
-            "Add-Type -AssemblyName System.Windows.Forms; "
-            "$f = New-Object System.Windows.Forms.FolderBrowserDialog; "
-            "$f.Description = 'Selecciona la carpeta de normativas'; "
-            "if ($f.ShowDialog() -eq 'OK') { Write-Output $f.SelectedPath }"
-        )
-    else:
-        filtro = "Archivos JSON (*.json)|*.json|Todos los archivos (*.*)|*.*" if filtro_json else "Todos los archivos (*.*)|*.*"
-        cmd = (
-            "Add-Type -AssemblyName System.Windows.Forms; "
-            "$f = New-Object System.Windows.Forms.OpenFileDialog; "
-            f"$f.Filter = '{filtro}'; "
-            "if ($f.ShowDialog() -eq 'OK') { Write-Output $f.FileName }"
-        )
-
-    try:
-        resultado = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", cmd],
-            capture_output=True,
-            text=True
+            creationflags=flags
         )
         return resultado.stdout.strip()
     except Exception as e:
-        print(f"[WARN SELECTOR WINDOWS] {e}")
+        print(f"[WARN DIALOGO TKINTER] Error al invocar selector: {e}")
         return ""
 
 
 @router.post("/browse-directory")
 def examinar_directorio_nativo():
-    """Abre el explorador de carpetas nativo instantáneamente."""
-    if sys.platform == "darwin":
-        ruta_elegida = _abrir_dialogo_macos(es_directorio=True)
-    elif sys.platform == "win32":
-        ruta_elegida = _abrir_dialogo_windows(es_directorio=True)
-    else:
-        ruta_elegida = ""
-
+    """Abre el explorador de carpetas usando Tkinter aislado."""
+    codigo = (
+        "import tkinter as tk; "
+        "from tkinter import filedialog; "
+        "root = tk.Tk(); "
+        "root.withdraw(); "
+        "root.attributes('-topmost', True); "
+        "root.after(50, lambda: root.focus_force()); "
+        "p = filedialog.askdirectory(title='Selecciona la carpeta de normativas'); "
+        "root.destroy(); "
+        "print(p if p else '')"
+    )
+    ruta_elegida = _ejecutar_tkinter_aislado(codigo)
     return {"ruta": ruta_elegida}
 
 
 @router.post("/browse-file")
 def examinar_archivo_nativo():
-    """Abre el explorador de archivos nativo (.json) instantáneamente."""
-    if sys.platform == "darwin":
-        ruta_elegida = _abrir_dialogo_macos(es_directorio=False, filtro_json=True)
-    elif sys.platform == "win32":
-        ruta_elegida = _abrir_dialogo_windows(es_directorio=False, filtro_json=True)
-    else:
-        ruta_elegida = ""
-
+    """Abre el explorador de archivos nativo (.json) usando Tkinter aislado."""
+    codigo = (
+        "import tkinter as tk; "
+        "from tkinter import filedialog; "
+        "root = tk.Tk(); "
+        "root.withdraw(); "
+        "root.attributes('-topmost', True); "
+        "root.after(50, lambda: root.focus_force()); "
+        "p = filedialog.askopenfilename("
+        "   title='Selecciona el chat a importar', "
+        "   filetypes=[('Archivos JSON', '*.json'), ('Todos los archivos', '*.*')]"
+        "); "
+        "root.destroy(); "
+        "print(p if p else '')"
+    )
+    ruta_elegida = _ejecutar_tkinter_aislado(codigo)
     return {"ruta": ruta_elegida}
 
 
