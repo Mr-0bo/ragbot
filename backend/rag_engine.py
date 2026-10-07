@@ -1,15 +1,17 @@
+# backend/rag_engine.py
 import re
 import uuid
 import json
+import asyncio
 from typing import List
 from sqlalchemy.orm import Session
 
 from backend.database import Usuario, SesionChat, Mensaje, ConfiguracionApp
 from backend.search_service import buscar_fragmentos
 from backend.llm_orchestrator import (
-    generar_respuesta_chat,
+    generar_respuesta_chat_async,
     clasificar_intencion,
-    reformular_pregunta_con_historial
+    reformular_pregunta_con_historial_async
 )
 from backend.prompts import (
     generar_system_prompt,
@@ -24,11 +26,10 @@ UMBRAL_SIMILITUD_MINIMO = 0.0
 def extraer_fuentes_citadas(texto_respuesta: str) -> List[str]:
     """
     Busca patrones de citación en el texto generado como:
-    [Norma_Tecnica.pdf, Pág. 3] o [Especificacion.pdf]
+    [Norma_Tecnica.pdf, Pág. 3] o [Especificacion.pdf, Pág. 2, 9]
     Devuelve las citas preservando el formato de corchetes, orden y sin duplicados.
-    Se flexibiliza la expresión regular para tolerar espacios opcionales.
     """
-    patron = r'\[([^\]]+\.pdf(?:\s*,\s*Pág\.\s*\d+)?)\]'
+    patron = r'\[([^\]]*?\.pdf[^\]]*?)\]'
     coincidencias = re.findall(patron, texto_respuesta, re.IGNORECASE)
 
     citas_unicas = []
@@ -40,15 +41,15 @@ def extraer_fuentes_citadas(texto_respuesta: str) -> List[str]:
     return citas_unicas
 
 
-def ejecutar_consulta(user_id: str, session_id: str, pregunta: str, db: Session) -> dict:
+async def ejecutar_consulta_async(user_id: str, session_id: str, pregunta: str, db: Session) -> dict:
     """
-    Pipeline RAG optimizado con dos etapas de recuperación:
+    Pipeline RAG asíncrono optimizado con dos etapas de recuperación:
     - Clasificación de intención local en CPU.
-    - Reformulación y descomposición de subconsultas vía Gemini 3.1 Flash Lite.
-    - Retrieval Híbrido en Qdrant (Dense BGE-M3 + BM25 con RRF, recall_k=25).
-    - Reranking semántico local vía BGE-Reranker-Base (top_k=6).
+    - Reformulación y desglose asíncrono con Gemini.
+    - Retrieval Híbrido en Qdrant (Dense BGE-M3 + BM25 con RRF, recall_k=12 optimizado).
+    - Reranking semántico local vía BGE-Reranker-Base en threadpool aislado.
     - Encapsulado de contexto en bloques XML.
-    - Síntesis técnica y citas normativas con Gemini 3.5 Flash Lite.
+    - Síntesis técnica y citas normativas asíncronas con Gemini.
     """
     # 1. Validar existencia de usuario y sesión
     usuario = db.query(Usuario).filter(Usuario.id == user_id).first()
@@ -90,30 +91,32 @@ def ejecutar_consulta(user_id: str, session_id: str, pregunta: str, db: Session)
         pronombre=usuario.pronombre or "neutro"
     )
 
-    # 7. Clasificar intención en local (0 llamadas de API)
+    # 7. Clasificar intención en local
     intencion = clasificar_intencion(pregunta)
     print(f"\n[ROUTER INTENCIÓN LOCAL] '{pregunta}' -> Clasificado como: {intencion}")
 
     if intencion == "CONVERSACIONAL":
         prompt_conversacion = generar_prompt_conversacional(pregunta)
-        respuesta_texto = generar_respuesta_chat(
+        respuesta_texto = await generar_respuesta_chat_async(
             system_prompt=system_prompt,
             user_prompt=prompt_conversacion,
             historial=historial_lista
         )
         fuentes_unicas = []
     else:
-        # Reformulación y desglose de subconsultas técnicas con Gemini 3.1 Flash Lite
-        subconsultas = reformular_pregunta_con_historial(historial_lista, pregunta)
-        print(f"[REFORMULACIÓN / DESGLOSE (3.1-FLASH-LITE)] -> {subconsultas}")
+        # Reformulación y desglose asíncrono
+        subconsultas = await reformular_pregunta_con_historial_async(historial_lista, pregunta)
+        print(f"[REFORMULACIÓN / DESGLOSE (ASYNC)] -> {subconsultas}")
 
-        # Búsqueda híbrida (BGE-M3 + BM25 con RRF) + Reranking (BGE-Reranker-Base)
-        todos_los_fragmentos = buscar_fragmentos(
+        # Búsqueda híbrida + Reranking en thread separado (no bloquea FastAPI)
+        # recall_k=12 para reducir a la mitad el cómputo en CPU
+        todos_los_fragmentos = await asyncio.to_thread(
+            buscar_fragmentos,
             consultas=subconsultas,
             consulta_referencia=pregunta,
             region=region_activa,
             top_k=6,
-            recall_k=25,
+            recall_k=12,
             max_por_doc=3,
             max_por_pagina=2
         )
@@ -123,7 +126,7 @@ def ejecutar_consulta(user_id: str, session_id: str, pregunta: str, db: Session)
 
         # Monitoreo detallado del contexto documental entregado
         print("\n" + "=" * 65)
-        print(f"[RAG ENGINE] FRAGMENTOS ENVIADOS A GEMINI 3.5 (XML) ({len(fragmentos_validos)}):")
+        print(f"[RAG ENGINE] FRAGMENTOS ENVIADOS A GEMINI (XML) ({len(fragmentos_validos)}):")
         for idx, f in enumerate(fragmentos_validos):
             print(f" [{idx + 1}] {f.get('documento')} | Pág: {f.get('pagina')} | Score Reranker: {f.get('score', 0):.4f}")
         print("=" * 65 + "\n")
@@ -132,8 +135,8 @@ def ejecutar_consulta(user_id: str, session_id: str, pregunta: str, db: Session)
             # Construcción de prompt con validación XML estricta
             prompt_usuario = generar_prompt_consulta(pregunta, fragmentos_validos)
 
-            # Generación técnica con Gemini 3.5 Flash Lite
-            respuesta_texto = generar_respuesta_chat(
+            # Generación técnica asíncrona
+            respuesta_texto = await generar_respuesta_chat_async(
                 system_prompt=system_prompt,
                 user_prompt=prompt_usuario,
                 historial=historial_lista
@@ -149,7 +152,6 @@ def ejecutar_consulta(user_id: str, session_id: str, pregunta: str, db: Session)
                 ]
                 resp_low = respuesta_texto.lower()
                 if not any(ind in resp_low for ind in indicadores_negativos_totales):
-                    # Fallback basado en los atributos de los fragmentos pasados en el XML
                     fuentes_unicas = list({f"[{f['documento']}, Pág. {f['pagina']}]" for f in fragmentos_validos})
         else:
             print("\n[AVISO] No se superó el umbral documental post-reranking.\n")
@@ -158,7 +160,7 @@ def ejecutar_consulta(user_id: str, session_id: str, pregunta: str, db: Session)
                 "Esta información técnica específica no se encuentra en los documentos indexados para la región seleccionada. "
                 "Indica brevemente en una sola oración que la especificación o dato no está disponible en la base técnica actual."
             )
-            respuesta_texto = generar_respuesta_chat(
+            respuesta_texto = await generar_respuesta_chat_async(
                 system_prompt=system_prompt,
                 user_prompt=prompt_usuario,
                 historial=historial_lista

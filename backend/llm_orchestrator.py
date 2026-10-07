@@ -1,4 +1,6 @@
+# backend/llm_orchestrator.py
 import re
+import asyncio
 import numpy as np
 from typing import List, Dict, Optional
 from google import genai
@@ -10,7 +12,7 @@ from backend.search_service import get_embedding_model
 # Singleton del cliente Gemini
 _client: Optional[genai.Client] = None
 
-# Configuración de referencias para clasificación conversacional local (100% en CPU con FastEmbed)
+# Configuración de referencias para clasificación conversacional local
 PATRON_CORTESIAS = re.compile(
     r'\b(hola|buenos\s+d[ií]as|buenas\s+(tardes|noches)|qu[eé]\s+tal|c[oó]mo\s+est[aá]s|'
     r'muchas\s+gracias|gracias|de\s+acuerdo|ok|entendido|perfecto|excelente|vale|'
@@ -46,7 +48,8 @@ def _get_vectores_conversacionales():
         modelo = get_embedding_model()
         vectores = []
         for frase in _FRASES_CONVERSACIONALES_REF:
-            vec = np.array(list(modelo.embed([frase]))[0], dtype=np.float32)
+            # Compatibilidad nativa con SentenceTransformer (.encode)
+            vec = np.array(modelo.encode(frase), dtype=np.float32)
             norm = np.linalg.norm(vec)
             if norm > 0:
                 vec = vec / norm
@@ -57,8 +60,8 @@ def _get_vectores_conversacionales():
 
 def clasificar_intencion(mensaje: str) -> str:
     """
-    Clasifica 100% en local si la intención es CONVERSACIONAL o TECNICA,
-    combinando depuración de cortesías y similitud semántica con BGE-M3.
+    Clasifica en local si la intención es CONVERSACIONAL o TECNICA,
+    priorizando expresiones regulares para resolver en <1 ms.
     """
     msg_limpio = mensaje.strip().lower()
     if not msg_limpio:
@@ -69,43 +72,34 @@ def clasificar_intencion(mensaje: str) -> str:
     residuo = PATRON_CORTESIAS.sub('', texto_sin_puntuacion).strip()
     palabras_residuo = residuo.split()
 
-    # Si tras quitar saludos no queda contenido sustancial, es meramente social
     if len(palabras_residuo) == 0:
         return "CONVERSACIONAL"
 
-    # Si restan 4 o más palabras, contiene una consulta técnica formulada
     if len(palabras_residuo) >= 4:
         return "TECNICA"
 
-    # 2. Evaluación semántica con BGE-M3 para frases cortas (1 a 3 palabras remanentes)
+    # 2. Evaluación semántica para frases cortas residuales (1 a 3 palabras)
     try:
         modelo = get_embedding_model()
-        vec_raw = np.array(list(modelo.embed([msg_limpio]))[0], dtype=np.float32)
+        vec_raw = np.array(modelo.encode(msg_limpio), dtype=np.float32)
         norm_pregunta = np.linalg.norm(vec_raw)
 
         if norm_pregunta > 0:
             vec_pregunta = vec_raw / norm_pregunta
             vectores_ref = _get_vectores_conversacionales()
-
-            # Producto punto sobre vectores unitarios = similitud coseno directa
             max_sim = max(float(np.dot(vec_pregunta, v)) for v in vectores_ref)
 
             if max_sim >= 0.65:
                 return "CONVERSACIONAL"
     except Exception as e:
-        print(f"[WARN CLASIFICADOR LOCAL] Error al calcular similitud semántica: {e}")
+        print(f"[WARN CLASIFICADOR LOCAL] Fallo al calcular similitud: {e}")
 
     return "TECNICA"
 
 
-def reformular_pregunta_con_historial(historial_mensajes: List[Dict], pregunta_actual: str) -> List[str]:
+async def reformular_pregunta_con_historial_async(historial_mensajes: List[Dict], pregunta_actual: str) -> List[str]:
     """
-    Utiliza Gemini 3.1 Flash Lite para reformular y descomponer consultas.
-    - Resuelve correferencias y pronombres del historial.
-    - Si la pregunta es compuesta (ej. toca dos temas técnicos distintos),
-      la separa en subconsultas individuales para que la búsqueda vectorial
-      recupere ambos aspectos sin sesgos de embedding.
-    Retorna una lista de cadenas de búsqueda para Qdrant.
+    Utiliza Gemini Flash Lite de forma asíncrona para resolver correferencias y descomponer consultas.
     """
     client = get_gemini_client()
 
@@ -116,26 +110,25 @@ def reformular_pregunta_con_historial(historial_mensajes: List[Dict], pregunta_a
             [f"{m['rol'].upper()}: {m['contenido']}" for m in ultimos_turnos]
         ) + "\n\n"
 
-    prompt = f"""Eres un optimizador de búsquedas vectoriales para documentación técnica de ingeniería.
-    Tu objetivo es analizar la última pregunta del usuario y convertirla en consultas directas y efectivas.
+    prompt = f"""Eres un optimizador de búsquedas vectoriales para documentación técnica y normativa.
+Tu objetivo es analizar la última pregunta del usuario y convertirla en consultas directas y efectivas.
 
-    Reglas:
-    1. Resuelve pronombres, términos ambiguos o temas implícitos usando el historial previo.
-    2. Si la pregunta plantea dos o más aspectos técnicos distintos (preguntas compuestas), sepárala en subconsultas independientes, una por línea.
-    3. Para conceptos de fórmulas, modelos matemáticos o cosas específicas, genera consultas concisas basadas en palabras clave técnicas, sin añadir palabras redundantes.
-    4. Responde ÚNICAMENTE con las consultas resultantes (una por línea), sin numeración, viñetas, guiones ni texto adicional.
+Reglas:
+1. Resuelve pronombres, términos ambiguos o temas implícitos usando el historial previo.
+2. Si la pregunta plantea dos o más aspectos técnicos distintos, sepárala en subconsultas independientes, una por línea.
+3. Para conceptos normativos, procesos o especificaciones, genera consultas concisas basadas en palabras clave técnicas esenciales.
+4. Responde ÚNICAMENTE con las consultas resultantes (una por línea), sin numeración, viñetas, guiones ni texto adicional.
 
-    {historial_contexto}Pregunta actual: {pregunta_actual}
-    """
+{historial_contexto}Pregunta actual: {pregunta_actual}
+"""
 
     try:
         modelo_rewrite = getattr(settings, "GEMINI_MODEL_REWRITE", "gemini-3.1-flash-lite")
-        respuesta = client.models.generate_content(
+        # Llamada asíncrona no bloqueante
+        respuesta = await client.aio.models.generate_content(
             model=modelo_rewrite,
             contents=prompt,
-            config=types.GenerateContentConfig(
-                temperature=0.0
-            )
+            config=types.GenerateContentConfig(temperature=0.0)
         )
         texto_salida = respuesta.text.strip() if respuesta.text else ""
         subconsultas = [
@@ -145,13 +138,13 @@ def reformular_pregunta_con_historial(historial_mensajes: List[Dict], pregunta_a
         ]
         return subconsultas if subconsultas else [pregunta_actual]
     except Exception as e:
-        print(f"[WARN REFORMULACIÓN GEMINI 3.1] Error: {e}")
+        print(f"[WARN REFORMULACIÓN GEMINI ASYNC] Error: {e}")
         return [pregunta_actual]
 
 
-def generar_respuesta_chat(system_prompt: str, user_prompt: str, historial: Optional[List[Dict]] = None) -> str:
+async def generar_respuesta_chat_async(system_prompt: str, user_prompt: str, historial: Optional[List[Dict]] = None) -> str:
     """
-    Invoca Gemini 3.5 Flash Lite para redactar la respuesta técnica y estructurar las citas.
+    Invoca Gemini de forma asíncrona para redactar la respuesta técnica sin bloquear Uvicorn.
     """
     try:
         client = get_gemini_client()
@@ -175,7 +168,7 @@ def generar_respuesta_chat(system_prompt: str, user_prompt: str, historial: Opti
         )
 
         modelo_synthesis = getattr(settings, "GEMINI_MODEL_SYNTHESIS", "gemini-3.5-flash-lite")
-        respuesta = client.models.generate_content(
+        respuesta = await client.aio.models.generate_content(
             model=modelo_synthesis,
             contents=contents,
             config=types.GenerateContentConfig(
@@ -185,5 +178,5 @@ def generar_respuesta_chat(system_prompt: str, user_prompt: str, historial: Opti
         )
         return respuesta.text if respuesta.text else "No se obtuvo respuesta del modelo."
     except Exception as e:
-        print(f"[ERROR GEMINI CHAT] {e}")
+        print(f"[ERROR GEMINI CHAT ASYNC] {e}")
         return "Hubo un inconveniente al comunicarse con el motor de IA. Inténtalo nuevamente."

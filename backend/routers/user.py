@@ -4,15 +4,13 @@ import sys
 import uuid
 import json
 import datetime
-import tkinter as tk
-from tkinter import filedialog
+import subprocess
 from pathlib import Path
 from typing import Optional, List
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 from sqlalchemy import case
-import multiprocessing
 
 from backend.database import get_db, Usuario, SesionChat, Mensaje, ConfiguracionApp
 
@@ -122,62 +120,102 @@ class MessageResponse(BaseModel):
 
 
 # ==========================================
-# ENDPOINTS DE CONFIGURACIÓN Y ONBOARDING (TKINTER EN SUBPROCESO AISLADO)
+# SELECTORES NATIVOS DEL SISTEMA OPERATIVO
 # ==========================================
-def _abrir_selector_carpeta(cola_resultado: multiprocessing.Queue):
-    """Ejecuta el selector de carpeta en un proceso aislado para cumplir con las reglas de macOS."""
-    try:
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes('-topmost', True)
-        root.after(1, lambda: root.focus_force())
-        ruta = filedialog.askdirectory(title="Selecciona la carpeta de normativas de OneDrive")
-        root.destroy()
-        cola_resultado.put(ruta if ruta else "")
-    except Exception as e:
-        print(f"[ERROR BROWSE DIR] {e}")
-        cola_resultado.put("")
-
-
-def _abrir_selector_archivo(cola_resultado: multiprocessing.Queue):
-    """Ejecuta el selector de archivo en un proceso aislado para cumplir con las reglas de macOS."""
-    try:
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes('-topmost', True)
-        root.after(1, lambda: root.focus_force())
-        ruta = filedialog.askopenfilename(
-            title="Selecciona el chat a importar",
-            filetypes=[("Archivos JSON", "*.json"), ("Todos los archivos", "*.*")]
+def _abrir_dialogo_macos(es_directorio: bool = True, filtro_json: bool = False) -> str:
+    """
+    Abre el diálogo nativo de macOS forzando foco de ventana vía System Events.
+    Aparece de forma inmediata al frente de la pantalla.
+    """
+    if es_directorio:
+        script = (
+            'tell application "System Events"\n'
+            '   activate\n'
+            '   set ruta to choose folder with prompt "Selecciona la carpeta de normativas"\n'
+            '   return POSIX path of ruta\n'
+            'end tell'
         )
-        root.destroy()
-        cola_resultado.put(ruta if ruta else "")
+    else:
+        tipo = '{"public.json"}' if filtro_json else '{"public.item"}'
+        script = (
+            'tell application "System Events"\n'
+            '   activate\n'
+            f'   set ruta to choose file of type {tipo} with prompt "Selecciona el archivo"\n'
+            '   return POSIX path of ruta\n'
+            'end tell'
+        )
+
+    try:
+        resultado = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        return resultado.stdout.strip()
+    except subprocess.CalledProcessError:
+        # El usuario canceló la selección
+        return ""
     except Exception as e:
-        print(f"[ERROR BROWSE FILE] {e}")
-        cola_resultado.put("")
+        print(f"[WARN SELECTOR MACOS] {e}")
+        return ""
+
+
+def _abrir_dialogo_windows(es_directorio: bool = True, filtro_json: bool = False) -> str:
+    """
+    Abre el diálogo nativo de Windows vía PowerShell sin instanciar librerías pesadas de Python.
+    """
+    if es_directorio:
+        cmd = (
+            "Add-Type -AssemblyName System.Windows.Forms; "
+            "$f = New-Object System.Windows.Forms.FolderBrowserDialog; "
+            "$f.Description = 'Selecciona la carpeta de normativas'; "
+            "if ($f.ShowDialog() -eq 'OK') { Write-Output $f.SelectedPath }"
+        )
+    else:
+        filtro = "Archivos JSON (*.json)|*.json|Todos los archivos (*.*)|*.*" if filtro_json else "Todos los archivos (*.*)|*.*"
+        cmd = (
+            "Add-Type -AssemblyName System.Windows.Forms; "
+            "$f = New-Object System.Windows.Forms.OpenFileDialog; "
+            f"$f.Filter = '{filtro}'; "
+            "if ($f.ShowDialog() -eq 'OK') { Write-Output $f.FileName }"
+        )
+
+    try:
+        resultado = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", cmd],
+            capture_output=True,
+            text=True
+        )
+        return resultado.stdout.strip()
+    except Exception as e:
+        print(f"[WARN SELECTOR WINDOWS] {e}")
+        return ""
 
 
 @router.post("/browse-directory")
 def examinar_directorio_nativo():
-    """Lanza el selector de carpetas en un proceso separado para evitar el bloqueo de hilo principal en macOS."""
-    cola = multiprocessing.Queue()
-    proceso = multiprocessing.Process(target=_abrir_selector_carpeta, args=(cola,))
-    proceso.start()
-    proceso.join()
+    """Abre el explorador de carpetas nativo instantáneamente."""
+    if sys.platform == "darwin":
+        ruta_elegida = _abrir_dialogo_macos(es_directorio=True)
+    elif sys.platform == "win32":
+        ruta_elegida = _abrir_dialogo_windows(es_directorio=True)
+    else:
+        ruta_elegida = ""
 
-    ruta_elegida = cola.get() if not cola.empty() else ""
     return {"ruta": ruta_elegida}
 
 
 @router.post("/browse-file")
 def examinar_archivo_nativo():
-    """Lanza el selector de archivos en un proceso separado para evitar el bloqueo de hilo principal en macOS."""
-    cola = multiprocessing.Queue()
-    proceso = multiprocessing.Process(target=_abrir_selector_archivo, args=(cola,))
-    proceso.start()
-    proceso.join()
+    """Abre el explorador de archivos nativo (.json) instantáneamente."""
+    if sys.platform == "darwin":
+        ruta_elegida = _abrir_dialogo_macos(es_directorio=False, filtro_json=True)
+    elif sys.platform == "win32":
+        ruta_elegida = _abrir_dialogo_windows(es_directorio=False, filtro_json=True)
+    else:
+        ruta_elegida = ""
 
-    ruta_elegida = cola.get() if not cola.empty() else ""
     return {"ruta": ruta_elegida}
 
 

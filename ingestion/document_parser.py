@@ -16,7 +16,7 @@ def _get_ocr_engine():
       from paddleocr import PaddleOCR
 
       # lang='es' o 'latin' para normativas en español
-      _ocr_engine = PaddleOCR(use_angle_cls=True, lang="es", show_log=False)
+      _ocr_engine = PaddleOCR(use_angle_cls=True, lang="es")
     except Exception as e:
       print(f"[WARN] No se pudo inicializar PaddleOCR: {e}")
       _ocr_engine = False
