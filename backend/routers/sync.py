@@ -1,9 +1,12 @@
 # backend/routers/sync.py
+import gc
 import json
 import hashlib
 import uuid
+import sys
 from pathlib import Path
 from typing import List
+import torch
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
@@ -105,7 +108,7 @@ def procesar_e_indexar_pdf(archivo: Path, region: str, db: Session):
     # Limpiar vectores previos en Qdrant por ruta antes de re-indexar
     eliminar_documento_por_ruta(ruta_abs)
 
-    # Extracción unificada con soporte de tablas Markdown y PaddleOCR
+    # Extracción unificada con PyMuPDF nativo (y fallback condicional a OCR)
     paginas = extraer_markdown_de_pdf(archivo)
     total_paginas = len(paginas)
 
@@ -134,15 +137,18 @@ def procesar_e_indexar_pdf(archivo: Path, region: str, db: Session):
             })
 
     if textos_chunk:
-        # Inferencia por lotes para control de memoria RAM
-        lote_size = 32
+        # Inferencia por lotes controlados para evitar picos de memoria RAM
+        lote_size = 16
         v_densos = []
         v_dispersos = []
 
         for b in range(0, len(textos_chunk), lote_size):
             sub_lote = textos_chunk[b: b + lote_size]
-            # Usar encode de SentenceTransformer para BGE-M3
-            vectores_lote = modelo_denso.encode(sub_lote)
+            vectores_lote = modelo_denso.encode(
+                sub_lote,
+                batch_size=16,
+                normalize_embeddings=True
+            )
             v_densos.extend(vectores_lote)
             v_dispersos.extend(list(modelo_disperso.embed(sub_lote)))
 
@@ -150,7 +156,6 @@ def procesar_e_indexar_pdf(archivo: Path, region: str, db: Session):
         for meta, vd, vs in zip(metadatos_chunk, v_densos, v_dispersos):
             point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{ruta_abs}_{meta['pagina']}_{meta['sub_idx']}"))
 
-            # Asegurar formato lista float nativa
             dense_vector = vd.tolist() if hasattr(vd, "tolist") else list(vd)
 
             vector_hibrido = {
@@ -176,6 +181,14 @@ def procesar_e_indexar_pdf(archivo: Path, region: str, db: Session):
             )
 
         indexar_chunks_documento(puntos_qdrant)
+
+        # Liberar memoria de tensores y vectores del documento procesado
+        del v_densos, v_dispersos, puntos_qdrant
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        elif sys.platform == "darwin" and torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+        gc.collect()
 
     # Actualizar registro en SQLite
     if not doc_db:

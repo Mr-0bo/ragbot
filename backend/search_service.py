@@ -1,23 +1,39 @@
+# backend/search_service.py
+import sys
+import torch
 from typing import List, Dict, Optional, Union
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
 from fastembed import SparseTextEmbedding
 from fastembed.rerank.cross_encoder import TextCrossEncoder
-from sentence_transformers import SentenceTransformer  # <-- Importamos la oficial
+from sentence_transformers import SentenceTransformer
 from backend.config import settings
+
+# BGE-M3 tiene dimensión estándar estricta de 1024
+DIMENSION_BGE_M3 = 1024
 
 # Instancias singleton para reutilizar memoria
 _qdrant_client: Optional[QdrantClient] = None
-_embedding_model: Optional[SentenceTransformer] = None  # <-- Cambia el tipo
+_embedding_model: Optional[SentenceTransformer] = None
 _sparse_model: Optional[SparseTextEmbedding] = None
 _reranker_model: Optional[TextCrossEncoder] = None
 
 
 def get_embedding_model() -> SentenceTransformer:
-    """Carga BAAI/bge-m3 nativamente con SentenceTransformers."""
+    """Carga BAAI/bge-m3 seleccionando el hardware óptimo (CUDA / MPS / CPU controlada)."""
     global _embedding_model
     if _embedding_model is None:
-        _embedding_model = SentenceTransformer(settings.EMBEDDING_MODEL_NAME)
+        if torch.cuda.is_available():
+            dispositivo = "cuda"
+        elif sys.platform == "darwin" and torch.backends.mps.is_available():
+            dispositivo = "mps"
+        else:
+            dispositivo = "cpu"
+            # En CPU (especialmente en Windows), evitar saturar el 100% de los núcleos
+            torch.set_num_threads(4)
+
+        print(f"[INFO EMBEDDINGS] Inicializando {settings.EMBEDDING_MODEL_NAME} en: {dispositivo.upper()}")
+        _embedding_model = SentenceTransformer(settings.EMBEDDING_MODEL_NAME, device=dispositivo)
     return _embedding_model
 
 
@@ -47,18 +63,13 @@ def get_qdrant_client() -> QdrantClient:
 
 
 def _inicializar_coleccion(client: QdrantClient):
-    """Crea la colección si no existe, configurando vectores densos y dispersos (híbrida)."""
+    """Crea la colección si no existe, usando dimensión fija sin cargar modelos en RAM."""
     if not client.collection_exists(settings.QDRANT_COLLECTION_NAME):
-        modelo_denso = get_embedding_model()
-        # <-- Adaptado para SentenceTransformer
-        vector_prueba = modelo_denso.encode("prueba").tolist()
-        dimension = len(vector_prueba)
-
         client.create_collection(
             collection_name=settings.QDRANT_COLLECTION_NAME,
             vectors_config={
                 "dense": models.VectorParams(
-                    size=dimension,
+                    size=DIMENSION_BGE_M3,
                     distance=models.Distance.COSINE
                 )
             },
@@ -77,15 +88,14 @@ def buscar_fragmentos(
         consulta_referencia: Optional[str] = None,
         region: str = "mexico",
         top_k: int = 6,
-        recall_k: int = 25,
+        recall_k: int = 12,
         max_por_doc: int = 3,
         max_por_pagina: int = 2
 ) -> List[Dict]:
     """
     Pipeline bi-etápico de recuperación:
-    1. Fase Híbrida: BGE-M3 + BM25 con RRF en Qdrant (obtiene candidatos amplios).
-    2. Fase Cross-Encoder: BGE-Reranker-Base clasifica (consulta_referencia, contenido)
-       y retorna los top_k más relevantes.
+    1. Fase Híbrida: BGE-M3 + BM25 con RRF en Qdrant (recall_k=12 para menor carga en CPU).
+    2. Fase Cross-Encoder: BGE-Reranker-Base clasifica y retorna los top_k más relevantes.
     """
     try:
         client = get_qdrant_client()
@@ -119,8 +129,7 @@ def buscar_fragmentos(
         # 1. Recuperación amplia con prefetches consolidados (Dense + Sparse)
         prefetches: List[models.Prefetch] = []
         for sub_query in subconsultas_validas:
-            # <-- Adaptado a SentenceTransformer
-            vector_denso = modelo_denso.encode(sub_query).tolist()
+            vector_denso = modelo_denso.encode(sub_query, normalize_embeddings=True).tolist()
             vector_disperso = list(modelo_disperso.embed([sub_query]))[0]
 
             prefetches.append(
