@@ -7,7 +7,6 @@ from typing import List
 from sqlalchemy.orm import Session
 
 from backend.database import Usuario, SesionChat, Mensaje, ConfiguracionApp
-from backend.search_service import buscar_fragmentos
 from backend.llm_orchestrator import (
     generar_respuesta_chat_async,
     clasificar_intencion,
@@ -104,12 +103,14 @@ async def ejecutar_consulta_async(user_id: str, session_id: str, pregunta: str, 
         )
         fuentes_unicas = []
     else:
+        # Import diferido de búsqueda para no frenar el inicio del servidor
+        from backend.search_service import buscar_fragmentos
+
         # Reformulación y desglose asíncrono
         subconsultas = await reformular_pregunta_con_historial_async(historial_lista, pregunta)
         print(f"[REFORMULACIÓN / DESGLOSE (ASYNC)] -> {subconsultas}")
 
         # Búsqueda híbrida + Reranking en thread separado (no bloquea FastAPI)
-        # recall_k=12 para reducir a la mitad el cómputo en CPU
         todos_los_fragmentos = await asyncio.to_thread(
             buscar_fragmentos,
             consultas=subconsultas,

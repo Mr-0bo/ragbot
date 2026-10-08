@@ -1,13 +1,11 @@
 # backend/search_service.py
 import os
 import sys
-import torch
 from typing import List, Dict, Optional, Union
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
 from fastembed import SparseTextEmbedding
 from fastembed.rerank.cross_encoder import TextCrossEncoder
-from sentence_transformers import SentenceTransformer
 from backend.config import settings
 
 # BGE-M3 tiene dimensión estándar estricta de 1024
@@ -15,15 +13,18 @@ DIMENSION_BGE_M3 = 1024
 
 # Instancias singleton para reutilizar memoria
 _qdrant_client: Optional[QdrantClient] = None
-_embedding_model: Optional[SentenceTransformer] = None
+_embedding_model = None
 _sparse_model: Optional[SparseTextEmbedding] = None
 _reranker_model: Optional[TextCrossEncoder] = None
 
 
-def get_embedding_model() -> SentenceTransformer:
-    """Carga BAAI/bge-m3 optimizado para CPU/GPU sin calcular atención sobre 8192 tokens."""
+def get_embedding_model():
+    """Carga BAAI/bge-m3 de forma diferida (Lazy Import) sin bloquear el arranque."""
     global _embedding_model
     if _embedding_model is None:
+        import torch
+        from sentence_transformers import SentenceTransformer
+
         if torch.cuda.is_available():
             dispositivo = "cuda"
         elif sys.platform == "darwin" and torch.backends.mps.is_available():
@@ -117,6 +118,8 @@ def buscar_fragmentos(
     2. Fase Cross-Encoder: BGE-Reranker-Base clasifica y retorna los top_k más relevantes.
     """
     try:
+        import torch
+
         client = get_qdrant_client()
         modelo_denso = get_embedding_model()
         modelo_disperso = get_sparse_model()

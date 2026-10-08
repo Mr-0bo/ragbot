@@ -6,21 +6,12 @@ import uuid
 import sys
 from pathlib import Path
 from typing import List
-import torch
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from qdrant_client.http import models
 
 from backend.database import get_db, SessionLocal, ConfiguracionApp, DocumentoNormativo
-from backend.search_service import (
-    get_embedding_model,
-    get_sparse_model,
-    indexar_chunks_documento,
-    eliminar_documento_por_ruta
-)
-from ingestion.document_parser import extraer_markdown_de_pdf
-from ingestion.ingest_docs import limpiar_texto, dividir_en_chunks
 
 router = APIRouter(prefix="/api/sync", tags=["Sincronización"])
 
@@ -94,6 +85,17 @@ def procesar_e_indexar_pdf(archivo: Path, region: str, db: Session):
     Extrae contenido preservando tablas Markdown y fallback a PaddleOCR,
     segmenta con Recursive Character Splitter, vectoriza (BGE-M3 + BM25) y persiste.
     """
+    # Lazy imports para no frenar el boot de la aplicación
+    import torch
+    from backend.search_service import (
+        get_embedding_model,
+        get_sparse_model,
+        indexar_chunks_documento,
+        eliminar_documento_por_ruta
+    )
+    from ingestion.document_parser import extraer_markdown_de_pdf
+    from ingestion.ingest_docs import limpiar_texto, dividir_en_chunks
+
     ruta_abs = str(archivo.resolve())
     nombre = archivo.name
     hash_actual = calcular_hash_archivo(archivo)
