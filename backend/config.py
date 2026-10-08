@@ -1,8 +1,17 @@
+# backend/config.py
 import os
 import sys
 from pathlib import Path
 import platformdirs
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# =======================================================
+# MODO OFFLINE ESTRICTO PARA HUGGING FACE / TRANSFORMERS
+# Evita chequeos constantes de ETag/versión en internet
+# =======================================================
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 
 
 def get_base_dir() -> Path:
@@ -17,21 +26,20 @@ class Settings(BaseSettings):
     GEMINI_API_KEY: str
 
     # Modelo para síntesis documental y citas normativas estrictas
-    GEMINI_MODEL_SYNTHESIS: str = "gemini-3.5-flash-lite"
+    GEMINI_MODEL_SYNTHESIS: str = "gemini-2.5-flash"
 
     # Modelo para reformulación y descomposición de subconsultas
-    GEMINI_MODEL_REWRITE: str = "gemini-3.1-flash-lite"
+    GEMINI_MODEL_REWRITE: str = "gemini-2.0-flash-lite"
 
     # Alias de compatibilidad hacia atrás
     @property
     def GEMINI_MODEL(self) -> str:
         return self.GEMINI_MODEL_SYNTHESIS
 
-    # Configuración de Embeddings Multilingües, Sparse y Reranker (FastEmbed en CPU)
+    # Configuración de Embeddings Multilingües, Sparse y Reranker
     EMBEDDING_MODEL_NAME: str = "BAAI/bge-m3"
     SPARSE_MODEL_NAME: str = "Qdrant/bm25"
     RERANKER_MODEL_NAME: str = "BAAI/bge-reranker-base"
-    # La dimensión (1024 para bge-m3) se autodetecta dinámicamente en search_service.py
 
     # Rutas de almacenamiento local de usuario (No requieren permisos de Administrador)
     APP_NAME: str = "CopilotoNormativas"

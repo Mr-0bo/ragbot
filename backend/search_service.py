@@ -20,7 +20,7 @@ _reranker_model: Optional[TextCrossEncoder] = None
 
 
 def get_embedding_model() -> SentenceTransformer:
-    """Carga BAAI/bge-m3 seleccionando el hardware óptimo (CUDA / MPS / CPU controlada)."""
+    """Carga BAAI/bge-m3 seleccionando hardware y forzando lectura offline local."""
     global _embedding_model
     if _embedding_model is None:
         if torch.cuda.is_available():
@@ -29,11 +29,25 @@ def get_embedding_model() -> SentenceTransformer:
             dispositivo = "mps"
         else:
             dispositivo = "cpu"
-            # En CPU (especialmente en Windows), evitar saturar el 100% de los núcleos
             torch.set_num_threads(4)
 
         print(f"[INFO EMBEDDINGS] Inicializando {settings.EMBEDDING_MODEL_NAME} en: {dispositivo.upper()}")
-        _embedding_model = SentenceTransformer(settings.EMBEDDING_MODEL_NAME, device=dispositivo)
+
+        # Priorizar lectura directa de archivos en caché local sin consultas a red
+        try:
+            _embedding_model = SentenceTransformer(
+                settings.EMBEDDING_MODEL_NAME,
+                device=dispositivo,
+                local_files_only=True
+            )
+        except Exception as e:
+            print(f"[WARN EMBEDDINGS] No se pudo cargar en modo puramente offline ({e}). Intentando con conexión...")
+            _embedding_model = SentenceTransformer(
+                settings.EMBEDDING_MODEL_NAME,
+                device=dispositivo,
+                local_files_only=False
+            )
+
     return _embedding_model
 
 
@@ -217,7 +231,8 @@ def buscar_fragmentos(
         print(f"\n--- [EVALUACIÓN POST-RERANKING ({region.upper()})] ---")
         fragmentos_finales = candidatos_ordenados[:top_k]
         for f in fragmentos_finales:
-            print(f"Doc: {f['documento']} | Pág: {f['pagina']} | Score Reranker: {f['score']:.4f} (RRF previo: {f['score_rrf']:.4f})")
+            print(
+                f"Doc: {f['documento']} | Pág: {f['pagina']} | Score Reranker: {f['score']:.4f} (RRF previo: {f['score_rrf']:.4f})")
 
         return fragmentos_finales
 
