@@ -85,7 +85,6 @@ def procesar_e_indexar_pdf(archivo: Path, region: str, db: Session):
     Extrae contenido preservando tablas Markdown y fallback a PaddleOCR,
     segmenta con Recursive Character Splitter, vectoriza (BGE-M3 + BM25) y persiste.
     """
-    # Lazy imports para no frenar el boot de la aplicación
     import torch
     from backend.search_service import (
         get_embedding_model,
@@ -103,14 +102,11 @@ def procesar_e_indexar_pdf(archivo: Path, region: str, db: Session):
 
     doc_db = db.query(DocumentoNormativo).filter(DocumentoNormativo.ruta_absoluta == ruta_abs).first()
 
-    # Si ya está indexado y no cambió su contenido, omitir reprocesamiento
     if doc_db and doc_db.hash_md5 == hash_actual and doc_db.esta_indexado:
         return
 
-    # Limpiar vectores previos en Qdrant por ruta antes de re-indexar
     eliminar_documento_por_ruta(ruta_abs)
 
-    # Extracción unificada con PyMuPDF nativo (y fallback condicional a OCR)
     paginas = extraer_markdown_de_pdf(archivo)
     total_paginas = len(paginas)
 
@@ -143,7 +139,6 @@ def procesar_e_indexar_pdf(archivo: Path, region: str, db: Session):
         v_densos = []
         v_dispersos = []
 
-        # inference_mode desactiva el rastreo de autograd y acelera la inferencia en CPU
         with torch.inference_mode():
             for b in range(0, len(textos_chunk), lote_size):
                 sub_lote = textos_chunk[b: b + lote_size]
@@ -186,7 +181,6 @@ def procesar_e_indexar_pdf(archivo: Path, region: str, db: Session):
 
         indexar_chunks_documento(puntos_qdrant)
 
-        # Liberar memoria de tensores y vectores del documento procesado
         del v_densos, v_dispersos, puntos_qdrant
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -194,7 +188,6 @@ def procesar_e_indexar_pdf(archivo: Path, region: str, db: Session):
             torch.mps.empty_cache()
         gc.collect()
 
-    # Actualizar registro en SQLite
     if not doc_db:
         doc_db = DocumentoNormativo(
             id=str(uuid.uuid4()),

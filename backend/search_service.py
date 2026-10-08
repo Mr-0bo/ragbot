@@ -1,6 +1,7 @@
 # backend/search_service.py
 import os
 import sys
+import threading
 from typing import List, Dict, Optional, Union
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
@@ -11,6 +12,9 @@ from backend.config import settings
 # BGE-M3 tiene dimensión estándar estricta de 1024
 DIMENSION_BGE_M3 = 1024
 
+# Lock para sincronizar inicialización y evitar competencia concurrente
+_lock_modelos = threading.Lock()
+
 # Instancias singleton para reutilizar memoria
 _qdrant_client: Optional[QdrantClient] = None
 _embedding_model = None
@@ -19,66 +23,85 @@ _reranker_model: Optional[TextCrossEncoder] = None
 
 
 def get_embedding_model():
-    """Carga BAAI/bge-m3 de forma diferida (Lazy Import) sin bloquear el arranque."""
+    """Carga BAAI/bge-m3 protegido contra concurrencia y sin descargas redundantes."""
     global _embedding_model
-    if _embedding_model is None:
-        import torch
-        from sentence_transformers import SentenceTransformer
+    with _lock_modelos:
+        if _embedding_model is None:
+            import torch
+            from sentence_transformers import SentenceTransformer
 
-        if torch.cuda.is_available():
-            dispositivo = "cuda"
-        elif sys.platform == "darwin" and torch.backends.mps.is_available():
-            dispositivo = "mps"
-        else:
-            dispositivo = "cpu"
-            cpus = os.cpu_count() or 4
-            torch.set_num_threads(cpus)
+            if torch.cuda.is_available():
+                dispositivo = "cuda"
+            elif sys.platform == "darwin" and torch.backends.mps.is_available():
+                dispositivo = "mps"
+            else:
+                dispositivo = "cpu"
+                cpus = os.cpu_count() or 4
+                torch.set_num_threads(cpus)
 
-        print(f"[INFO EMBEDDINGS] Inicializando {settings.EMBEDDING_MODEL_NAME} en: {dispositivo.upper()}")
+            print(f"[INFO EMBEDDINGS] Inicializando {settings.EMBEDDING_MODEL_NAME} en: {dispositivo.upper()}")
 
-        # Priorizar lectura directa de archivos en caché local sin consultas a red
-        try:
-            _embedding_model = SentenceTransformer(
-                settings.EMBEDDING_MODEL_NAME,
-                device=dispositivo,
-                local_files_only=True
-            )
-        except Exception as e:
-            print(f"[WARN EMBEDDINGS] No se pudo cargar en modo puramente offline ({e}). Intentando con conexión...")
-            _embedding_model = SentenceTransformer(
-                settings.EMBEDDING_MODEL_NAME,
-                device=dispositivo,
-                local_files_only=False
-            )
+            try:
+                _embedding_model = SentenceTransformer(
+                    settings.EMBEDDING_MODEL_NAME,
+                    device=dispositivo,
+                    local_files_only=True
+                )
+            except Exception:
+                _embedding_model = SentenceTransformer(
+                    settings.EMBEDDING_MODEL_NAME,
+                    device=dispositivo,
+                    local_files_only=False
+                )
 
-        # Limitar la ventana a 512 tokens para acelerar radicalmente la inferencia en CPU
-        _embedding_model.max_seq_length = 512
+            _embedding_model.max_seq_length = 512
 
     return _embedding_model
 
 
 def get_sparse_model() -> SparseTextEmbedding:
-    """Carga de forma perezosa el modelo BM25 (disperso) local."""
+    """Carga BM25 forzando lectura local para evitar [Errno 11001]."""
     global _sparse_model
-    if _sparse_model is None:
-        _sparse_model = SparseTextEmbedding(model_name=settings.SPARSE_MODEL_NAME)
+    with _lock_modelos:
+        if _sparse_model is None:
+            try:
+                _sparse_model = SparseTextEmbedding(
+                    model_name=settings.SPARSE_MODEL_NAME,
+                    local_files_only=True
+                )
+            except Exception:
+                _sparse_model = SparseTextEmbedding(
+                    model_name=settings.SPARSE_MODEL_NAME,
+                    local_files_only=False
+                )
     return _sparse_model
 
 
 def get_reranker_model() -> TextCrossEncoder:
-    """Carga de forma perezosa el modelo Cross-Encoder (Reranker) local en CPU."""
+    """Carga el Reranker forzando lectura local para evitar [Errno 11001]."""
     global _reranker_model
-    if _reranker_model is None:
-        _reranker_model = TextCrossEncoder(model_name=settings.RERANKER_MODEL_NAME)
+    with _lock_modelos:
+        if _reranker_model is None:
+            try:
+                _reranker_model = TextCrossEncoder(
+                    model_name=settings.RERANKER_MODEL_NAME,
+                    local_files_only=True
+                )
+            except Exception:
+                _reranker_model = TextCrossEncoder(
+                    model_name=settings.RERANKER_MODEL_NAME,
+                    local_files_only=False
+                )
     return _reranker_model
 
 
 def get_qdrant_client() -> QdrantClient:
     """Inicializa la base de datos vectorial local en la ruta de usuario segura."""
     global _qdrant_client
-    if _qdrant_client is None:
-        _qdrant_client = QdrantClient(path=str(settings.qdrant_path))
-        _inicializar_coleccion(_qdrant_client)
+    with _lock_modelos:
+        if _qdrant_client is None:
+            _qdrant_client = QdrantClient(path=str(settings.qdrant_path))
+            _inicializar_coleccion(_qdrant_client)
     return _qdrant_client
 
 
@@ -133,7 +156,6 @@ def buscar_fragmentos(
         if not subconsultas_validas:
             return []
 
-        # Determinar consulta base para el reranking
         query_rerank = (consulta_referencia or subconsultas_validas[0]).strip()
 
         print(f"\n[DEBUG SEARCH] Subconsultas recibidas ({len(subconsultas_validas)}): {subconsultas_validas}")
@@ -148,7 +170,6 @@ def buscar_fragmentos(
             ]
         )
 
-        # 1. Recuperación amplia con prefetches consolidados (Dense + Sparse)
         prefetches: List[models.Prefetch] = []
         with torch.inference_mode():
             for sub_query in subconsultas_validas:
@@ -175,7 +196,6 @@ def buscar_fragmentos(
                     )
                 )
 
-        # Fusión RRF en Qdrant
         respuesta = client.query_points(
             collection_name=settings.QDRANT_COLLECTION_NAME,
             prefetch=prefetches,
@@ -191,7 +211,6 @@ def buscar_fragmentos(
         if not puntos_fusionados:
             return []
 
-        # 2. Filtrado inicial por documento/página para la bolsa de candidatos del Reranker
         candidatos_rerank = []
         conteo_doc_pre: Dict[str, int] = {}
         conteo_pag_pre: Dict[str, int] = {}
@@ -227,7 +246,6 @@ def buscar_fragmentos(
             if len(candidatos_rerank) >= recall_k:
                 break
 
-        # 3. Fase 2: Reranking con Cross-Encoder local en CPU
         reranker = get_reranker_model()
         textos_candidatos = [c["contenido"] for c in candidatos_rerank]
         scores_rerank = list(reranker.rerank(query_rerank, textos_candidatos))
