@@ -1,4 +1,5 @@
 # backend/search_service.py
+import os
 import sys
 import torch
 from typing import List, Dict, Optional, Union
@@ -20,7 +21,7 @@ _reranker_model: Optional[TextCrossEncoder] = None
 
 
 def get_embedding_model() -> SentenceTransformer:
-    """Carga BAAI/bge-m3 seleccionando hardware y forzando lectura offline local."""
+    """Carga BAAI/bge-m3 optimizado para CPU/GPU sin calcular atención sobre 8192 tokens."""
     global _embedding_model
     if _embedding_model is None:
         if torch.cuda.is_available():
@@ -29,7 +30,8 @@ def get_embedding_model() -> SentenceTransformer:
             dispositivo = "mps"
         else:
             dispositivo = "cpu"
-            torch.set_num_threads(4)
+            cpus = os.cpu_count() or 4
+            torch.set_num_threads(cpus)
 
         print(f"[INFO EMBEDDINGS] Inicializando {settings.EMBEDDING_MODEL_NAME} en: {dispositivo.upper()}")
 
@@ -47,6 +49,9 @@ def get_embedding_model() -> SentenceTransformer:
                 device=dispositivo,
                 local_files_only=False
             )
+
+        # Limitar la ventana a 512 tokens para acelerar radicalmente la inferencia en CPU
+        _embedding_model.max_seq_length = 512
 
     return _embedding_model
 
@@ -142,29 +147,30 @@ def buscar_fragmentos(
 
         # 1. Recuperación amplia con prefetches consolidados (Dense + Sparse)
         prefetches: List[models.Prefetch] = []
-        for sub_query in subconsultas_validas:
-            vector_denso = modelo_denso.encode(sub_query, normalize_embeddings=True).tolist()
-            vector_disperso = list(modelo_disperso.embed([sub_query]))[0]
+        with torch.inference_mode():
+            for sub_query in subconsultas_validas:
+                vector_denso = modelo_denso.encode(sub_query, normalize_embeddings=True).tolist()
+                vector_disperso = list(modelo_disperso.embed([sub_query]))[0]
 
-            prefetches.append(
-                models.Prefetch(
-                    query=vector_denso,
-                    using="dense",
-                    limit=recall_k * 2,
-                    filter=filtro_region
+                prefetches.append(
+                    models.Prefetch(
+                        query=vector_denso,
+                        using="dense",
+                        limit=recall_k * 2,
+                        filter=filtro_region
+                    )
                 )
-            )
-            prefetches.append(
-                models.Prefetch(
-                    query=models.SparseVector(
-                        indices=vector_disperso.indices.tolist(),
-                        values=vector_disperso.values.tolist()
-                    ),
-                    using="sparse",
-                    limit=recall_k * 2,
-                    filter=filtro_region
+                prefetches.append(
+                    models.Prefetch(
+                        query=models.SparseVector(
+                            indices=vector_disperso.indices.tolist(),
+                            values=vector_disperso.values.tolist()
+                        ),
+                        using="sparse",
+                        limit=recall_k * 2,
+                        filter=filtro_region
+                    )
                 )
-            )
 
         # Fusión RRF en Qdrant
         respuesta = client.query_points(

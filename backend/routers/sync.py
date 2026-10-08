@@ -137,20 +137,22 @@ def procesar_e_indexar_pdf(archivo: Path, region: str, db: Session):
             })
 
     if textos_chunk:
-        # Inferencia por lotes controlados para evitar picos de memoria RAM
         lote_size = 16
         v_densos = []
         v_dispersos = []
 
-        for b in range(0, len(textos_chunk), lote_size):
-            sub_lote = textos_chunk[b: b + lote_size]
-            vectores_lote = modelo_denso.encode(
-                sub_lote,
-                batch_size=16,
-                normalize_embeddings=True
-            )
-            v_densos.extend(vectores_lote)
-            v_dispersos.extend(list(modelo_disperso.embed(sub_lote)))
+        # inference_mode desactiva el rastreo de autograd y acelera la inferencia en CPU
+        with torch.inference_mode():
+            for b in range(0, len(textos_chunk), lote_size):
+                sub_lote = textos_chunk[b: b + lote_size]
+                vectores_lote = modelo_denso.encode(
+                    sub_lote,
+                    batch_size=16,
+                    show_progress_bar=False,
+                    normalize_embeddings=True
+                )
+                v_densos.extend(vectores_lote)
+                v_dispersos.extend(list(modelo_disperso.embed(sub_lote)))
 
         puntos_qdrant = []
         for meta, vd, vs in zip(metadatos_chunk, v_densos, v_dispersos):
