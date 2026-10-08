@@ -277,3 +277,16 @@ def indexar_chunks_documento(puntos: List[models.PointStruct]):
         collection_name=settings.QDRANT_COLLECTION_NAME,
         points=puntos
     )
+
+
+def precargar_modelos_en_segundo_plano():
+    """Ejecuta la importación y carga de modelos en segundo plano tras levantar el servidor."""
+    try:
+        print("\n[WARM-UP] Iniciando precarga silenciosa de modelos en segundo plano...")
+        get_embedding_model()
+        get_sparse_model()
+        get_reranker_model()
+        get_qdrant_client()
+        print("[WARM-UP] Modelos precargados exitosamente en memoria RAM. Listo para inferencia instantánea.\n")
+    except Exception as e:
+        print(f"[WARM-UP WARN] No se completó la precarga en background: {e}")
