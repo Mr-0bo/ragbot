@@ -5,11 +5,6 @@ from pathlib import Path
 import platformdirs
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-# Modo offline estricto
-os.environ["HF_HUB_OFFLINE"] = "1"
-os.environ["TRANSFORMERS_OFFLINE"] = "1"
-os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
-
 
 def get_base_dir() -> Path:
     """Retorna la ruta base de la aplicación tanto en desarrollo como empaquetada."""
@@ -67,7 +62,6 @@ class Settings(BaseSettings):
         """URL de conexión para SQLAlchemy."""
         return f"sqlite:///{self.sqlite_path}"
 
-    # Rutas físicas a los modelos empaquetados
     @property
     def models_cache_dir(self) -> Path:
         return get_base_dir() / "models_cache"

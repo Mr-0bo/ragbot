@@ -4,8 +4,9 @@ import json
 import hashlib
 import uuid
 import sys
+import time
 from pathlib import Path
-from typing import List
+from typing import List, Dict, Any
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
@@ -41,7 +42,6 @@ def calcular_hash_archivo(ruta: Path) -> str:
 
 @router.get("/check")
 def verificar_cambios_pendientes(db: Session = Depends(get_db)):
-    """Verifica en segundo plano si hay PDFs nuevos, modificados o eliminados."""
     config = db.query(ConfiguracionApp).first()
     if not config or not config.directorio_obligatorio:
         return {"requiere_sincronizacion": False, "total_pendientes": 0}
@@ -80,10 +80,14 @@ def verificar_cambios_pendientes(db: Session = Depends(get_db)):
     }
 
 
-def procesar_e_indexar_pdf(archivo: Path, region: str, db: Session):
+def procesar_e_indexar_pdf(archivo: Path, region: str, db: Session) -> Dict[str, Any]:
     """
-    Extrae contenido preservando tablas Markdown y fallback a PaddleOCR,
-    segmenta con Recursive Character Splitter, vectoriza (BGE-M3 + BM25) y persiste.
+    Pipeline instrumentado:
+    1. Parseo/OCR (PyMuPDF / PaddleOCR)
+    2. Chunking Recursivo
+    3. Inferencia de Embeddings (Dense BGE-M3 + Sparse BM25)
+    4. Upsert en Qdrant + SQLite
+    Retorna métricas de telemetría y muestra resumen en consola.
     """
     import torch
     from backend.search_service import (
@@ -95,6 +99,7 @@ def procesar_e_indexar_pdf(archivo: Path, region: str, db: Session):
     from ingestion.document_parser import extraer_markdown_de_pdf
     from ingestion.ingest_docs import limpiar_texto, dividir_en_chunks
 
+    t_inicio_total = time.perf_counter()
     ruta_abs = str(archivo.resolve())
     nombre = archivo.name
     hash_actual = calcular_hash_archivo(archivo)
@@ -103,16 +108,17 @@ def procesar_e_indexar_pdf(archivo: Path, region: str, db: Session):
     doc_db = db.query(DocumentoNormativo).filter(DocumentoNormativo.ruta_absoluta == ruta_abs).first()
 
     if doc_db and doc_db.hash_md5 == hash_actual and doc_db.esta_indexado:
-        return
+        print(f"[DEBUGGER] ⏭️ Omitiendo '{nombre}' (Sin cambios)")
+        return {"omitido": True, "nombre": nombre}
 
-    eliminar_documento_por_ruta(ruta_abs)
-
-    paginas = extraer_markdown_de_pdf(archivo)
+    # 1. Extracción de texto
+    t0_parse = time.perf_counter()
+    paginas = extraer_markdown_de_pdf(archivo, verbose=True)
+    t_parse = time.perf_counter() - t0_parse
     total_paginas = len(paginas)
 
-    modelo_denso = get_embedding_model()
-    modelo_disperso = get_sparse_model()
-
+    # 2. Segmentación / Chunking
+    t0_chunk = time.perf_counter()
     textos_chunk = []
     metadatos_chunk = []
     chunk_index = 0
@@ -131,43 +137,79 @@ def procesar_e_indexar_pdf(archivo: Path, region: str, db: Session):
             metadatos_chunk.append({
                 "pagina": num_pag,
                 "sub_idx": sub_idx,
+                "caracteres": len(chunk),
                 "texto": chunk
             })
 
+    t_chunk = time.perf_counter() - t0_chunk
+
+    # Muestra visual en consola de los chunks
+    print(f"\n[DEBUGGER CHUNKS] ✂️ '{nombre}': {len(textos_chunk)} fragmentos creados en {t_chunk*1000:.1f}ms")
+    for i, meta in enumerate(metadatos_chunk[:3]):  # Mostrar los primeros 3 chunks como muestra
+        preview = meta['texto'][:80].replace("\n", " ")
+        print(f"   ├─ Chunk #{i+1:02d} (Pág {meta['pagina']}) [{meta['caracteres']} chars]: \"{preview}...\"")
+    if len(metadatos_chunk) > 3:
+        print(f"   └─ ... y {len(metadatos_chunk) - 3} chunks adicionales.")
+
+    # 3. Vectorización
+    t_dense = 0.0
+    t_sparse = 0.0
+    t_qdrant = 0.0
+
     if textos_chunk:
+        modelo_denso = get_embedding_model()
+        modelo_disperso = get_sparse_model()
+
+        eliminar_documento_por_ruta(ruta_abs)
+
         lote_size = 16
         v_densos = []
         v_dispersos = []
 
+        print(f"\n[DEBUGGER INFERENCIA] 🧠 Vectorizando {len(textos_chunk)} chunks en lotes de {lote_size}...")
+
         with torch.inference_mode():
             for b in range(0, len(textos_chunk), lote_size):
                 sub_lote = textos_chunk[b: b + lote_size]
+
+                t0_d = time.perf_counter()
                 vectores_lote = modelo_denso.encode(
                     sub_lote,
-                    batch_size=16,
+                    batch_size=lote_size,
                     show_progress_bar=False,
                     normalize_embeddings=True
                 )
+                t_dense += (time.perf_counter() - t0_d)
                 v_densos.extend(vectores_lote)
-                v_dispersos.extend(list(modelo_disperso.embed(sub_lote)))
 
+                if modelo_disperso:
+                    t0_s = time.perf_counter()
+                    v_dispersos.extend(list(modelo_disperso.embed(sub_lote)))
+                    t_sparse += (time.perf_counter() - t0_s)
+
+        # 4. Inserción en Qdrant
+        t0_qdrant = time.perf_counter()
         puntos_qdrant = []
-        for meta, vd, vs in zip(metadatos_chunk, v_densos, v_dispersos):
+        for i, meta in enumerate(metadatos_chunk):
             point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{ruta_abs}_{meta['pagina']}_{meta['sub_idx']}"))
+            dense_vector = v_densos[i].tolist() if hasattr(v_densos[i], "tolist") else list(v_densos[i])
 
-            dense_vector = vd.tolist() if hasattr(vd, "tolist") else list(vd)
+            if modelo_disperso and i < len(v_dispersos):
+                vs = v_dispersos[i]
+                vector_payload = {
+                    "dense": dense_vector,
+                    "sparse": models.SparseVector(
+                        indices=vs.indices.tolist(),
+                        values=vs.values.tolist()
+                    )
+                }
+            else:
+                vector_payload = {"dense": dense_vector}
 
-            vector_hibrido = {
-                "dense": dense_vector,
-                "sparse": models.SparseVector(
-                    indices=vs.indices.tolist(),
-                    values=vs.values.tolist()
-                )
-            }
             puntos_qdrant.append(
                 models.PointStruct(
                     id=point_id,
-                    vector=vector_hibrido,
+                    vector=vector_payload,
                     payload={
                         "documento": nombre,
                         "ruta_relativa": ruta_abs,
@@ -180,6 +222,7 @@ def procesar_e_indexar_pdf(archivo: Path, region: str, db: Session):
             )
 
         indexar_chunks_documento(puntos_qdrant)
+        t_qdrant = time.perf_counter() - t0_qdrant
 
         del v_densos, v_dispersos, puntos_qdrant
         if torch.cuda.is_available():
@@ -188,6 +231,7 @@ def procesar_e_indexar_pdf(archivo: Path, region: str, db: Session):
             torch.mps.empty_cache()
         gc.collect()
 
+    # 5. Persistencia SQLite
     if not doc_db:
         doc_db = DocumentoNormativo(
             id=str(uuid.uuid4()),
@@ -206,9 +250,43 @@ def procesar_e_indexar_pdf(archivo: Path, region: str, db: Session):
     doc_db.esta_indexado = True
     db.commit()
 
+    duracion_total = time.perf_counter() - t_inicio_total
+
+    # Resumen estructurado del archivo
+    print(f"""
+╔═══════════════════════════════════════════════════════════════════╗
+║ TELEMETRÍA DE INDEXACIÓN: {nombre[:38]:<39} ║
+╠═══════════════════════════════════════════════════════════════════╣
+║  • Páginas procesadas    : {total_paginas:<6} ({t_parse:.2f} s)                    ║
+║  • Chunks generados      : {chunk_index:<6} ({t_chunk*1000:.1f} ms)                 ║
+║  • Inferencia BGE-M3     : {t_dense:.2f} s                              ║
+║  • Inferencia BM25       : {t_sparse:.2f} s                              ║
+║  • Inserción Qdrant      : {t_qdrant:.2f} s                              ║
+║  ───────────────────────────────────────────────────────────────  ║
+║  ⏱️ TIEMPO TOTAL          : {duracion_total:.2f} s                              ║
+╚═══════════════════════════════════════════════════════════════════╝
+""")
+
+    return {
+        "omitido": False,
+        "nombre": nombre,
+        "paginas": total_paginas,
+        "chunks": chunk_index,
+        "tiempo_total_s": round(duracion_total, 2),
+        "tiempo_parse_s": round(t_parse, 2),
+        "tiempo_chunk_ms": round(t_chunk * 1000, 2),
+        "tiempo_denso_s": round(t_dense, 2),
+        "tiempo_sparse_s": round(t_sparse, 2),
+        "tiempo_qdrant_s": round(t_qdrant, 2),
+        "ejemplos_chunks": [
+            {"chunk_id": idx + 1, "pagina": m["pagina"], "chars": m["caracteres"], "texto": m["texto"][:120]}
+            for idx, m in enumerate(metadatos_chunk[:5])
+        ]
+    }
+
 
 def generador_indexacion_sse():
-    """Generador que procesa los documentos y emite eventos SSE al frontend."""
+    """Emite eventos SSE de progreso y paquetes de telemetría detallada."""
     db = SessionLocal()
     try:
         config = db.query(ConfiguracionApp).first()
@@ -225,7 +303,7 @@ def generador_indexacion_sse():
         total = len(archivos)
 
         if total == 0:
-            yield f"data: {json.dumps({'tipo': 'progreso', 'progreso': 100, 'archivo': 'Sin archivos PDF', 'mensaje': 'No se encontraron PDFs en las carpetas seleccionadas.'})}\n\n"
+            yield f"data: {json.dumps({'tipo': 'progreso', 'progreso': 100, 'archivo': 'Sin PDFs', 'mensaje': 'No se encontraron PDFs.'})}\n\n"
             yield f"data: {json.dumps({'tipo': 'fin'})}\n\n"
             return
 
@@ -233,18 +311,15 @@ def generador_indexacion_sse():
             nombre = archivo.name
             porcentaje = int((i / total) * 100)
 
-            payload_progreso = {
-                "tipo": "progreso",
-                "progreso": porcentaje,
-                "archivo": nombre,
-                "mensaje": f"Procesando {i} de {total}"
-            }
-            yield f"data: {json.dumps(payload_progreso)}\n\n"
+            yield f"data: {json.dumps({'tipo': 'progreso', 'progreso': porcentaje, 'archivo': nombre, 'mensaje': f'Procesando {i} de {total}'})}\n\n"
 
             try:
-                procesar_e_indexar_pdf(archivo, region=config.region or "mexico", db=db)
+                metricas = procesar_e_indexar_pdf(archivo, region=config.region or "mexico", db=db)
+                # Envío de métricas al cliente
+                yield f"data: {json.dumps({'tipo': 'telemetria', 'datos': metricas})}\n\n"
             except Exception as e:
                 print(f"[WARN INDEX] Error al indexar {nombre}: {e}")
+                yield f"data: {json.dumps({'tipo': 'error_archivo', 'archivo': nombre, 'error': str(e)})}\n\n"
 
         yield f"data: {json.dumps({'tipo': 'fin'})}\n\n"
 
@@ -257,7 +332,6 @@ def generador_indexacion_sse():
 
 @router.get("/stream")
 def stream_indexacion():
-    """Endpoint Server-Sent Events (SSE) consumido por EventSource en app.js."""
     return StreamingResponse(
         generador_indexacion_sse(),
         media_type="text/event-stream",

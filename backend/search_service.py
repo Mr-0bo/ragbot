@@ -21,7 +21,7 @@ _reranker_model: Optional[TextCrossEncoder] = None
 
 
 def get_embedding_model():
-    """Carga BAAI/bge-m3 desde la carpeta local preempaquetada."""
+    """Carga BAAI/bge-m3; si no está local, lo descarga automáticamente."""
     global _embedding_model
     with _lock_modelos:
         if _embedding_model is None:
@@ -37,84 +37,48 @@ def get_embedding_model():
                 cpus = os.cpu_count() or 4
                 torch.set_num_threads(cpus)
 
-            # Priorizar la ruta local empaquetada
             ruta_local = Path(settings.dense_model_path)
-            modelo_origen = str(ruta_local) if ruta_local.exists() else settings.EMBEDDING_MODEL_NAME
+            modelo_origen = str(ruta_local) if (ruta_local.exists() and any(ruta_local.iterdir())) else settings.EMBEDDING_MODEL_NAME
 
             print(f"[INFO EMBEDDINGS] Inicializando {modelo_origen} en: {dispositivo.upper()}")
 
-            try:
-                _embedding_model = SentenceTransformer(
-                    modelo_origen,
-                    device=dispositivo,
-                    local_files_only=True
-                )
-            except Exception:
-                _embedding_model = SentenceTransformer(
-                    modelo_origen,
-                    device=dispositivo,
-                    local_files_only=False
-                )
-
+            _embedding_model = SentenceTransformer(
+                modelo_origen,
+                device=dispositivo
+            )
             _embedding_model.max_seq_length = 512
 
     return _embedding_model
 
 
 def get_sparse_model() -> SparseTextEmbedding:
-    """Carga BM25 directamente desde la ruta local para evitar llamadas a red o bugs con tar.gz."""
+    """Carga BM25 con descarga automática gestionada por FastEmbed si falta."""
     global _sparse_model
     with _lock_modelos:
         if _sparse_model is None:
-            cache_path = Path(settings.fastembed_cache_dir)
-            directorio_bm25 = cache_path / "bm25"
-
-            # Si la carpeta local existe, se pasa como ruta directa para omitir retrieve_model_gcs
-            ruta_modelo = str(directorio_bm25) if directorio_bm25.exists() else settings.SPARSE_MODEL_NAME
-
-            try:
-                _sparse_model = SparseTextEmbedding(
-                    model_name=ruta_modelo,
-                    cache_dir=str(cache_path),
-                    local_files_only=True
-                )
-            except Exception:
-                _sparse_model = SparseTextEmbedding(
-                    model_name=settings.SPARSE_MODEL_NAME,
-                    cache_dir=str(cache_path),
-                    local_files_only=False
-                )
+            cache_path = str(settings.fastembed_cache_dir)
+            _sparse_model = SparseTextEmbedding(
+                model_name=settings.SPARSE_MODEL_NAME,
+                cache_dir=cache_path
+            )
     return _sparse_model
 
 
 def get_reranker_model() -> TextCrossEncoder:
-    """Carga el Cross-Encoder directamente desde la ruta local para evitar llamadas a red."""
+    """Carga el Reranker con descarga automática gestionada por FastEmbed si falta."""
     global _reranker_model
     with _lock_modelos:
         if _reranker_model is None:
-            cache_path = Path(settings.fastembed_cache_dir)
-            directorio_reranker = cache_path / "bge-reranker-base"
-
-            # Si la carpeta local existe, se pasa como ruta directa para omitir retrieve_model_gcs
-            ruta_modelo = str(directorio_reranker) if directorio_reranker.exists() else settings.RERANKER_MODEL_NAME
-
-            try:
-                _reranker_model = TextCrossEncoder(
-                    model_name=ruta_modelo,
-                    cache_dir=str(cache_path),
-                    local_files_only=True
-                )
-            except Exception:
-                _reranker_model = TextCrossEncoder(
-                    model_name=settings.RERANKER_MODEL_NAME,
-                    cache_dir=str(cache_path),
-                    local_files_only=False
-                )
+            cache_path = str(settings.fastembed_cache_dir)
+            _reranker_model = TextCrossEncoder(
+                model_name=settings.RERANKER_MODEL_NAME,
+                cache_dir=cache_path
+            )
     return _reranker_model
 
 
 def get_qdrant_client() -> QdrantClient:
-    """Inicializa la base de datos vectorial local en la ruta de usuario segura."""
+    """Inicializa la base de datos vectorial local."""
     global _qdrant_client
     with _lock_modelos:
         if _qdrant_client is None:
@@ -124,7 +88,7 @@ def get_qdrant_client() -> QdrantClient:
 
 
 def _inicializar_coleccion(client: QdrantClient):
-    """Crea la colección si no existe, usando dimensión fija sin cargar modelos en RAM."""
+    """Crea la colección híbrida si no existe."""
     if not client.collection_exists(settings.QDRANT_COLLECTION_NAME):
         client.create_collection(
             collection_name=settings.QDRANT_COLLECTION_NAME,
@@ -153,7 +117,7 @@ def buscar_fragmentos(
         max_por_doc: int = 3,
         max_por_pagina: int = 2
 ) -> List[Dict]:
-    """Pipeline bi-etápico de recuperación híbrida + reranking."""
+    """Pipeline híbrido Dense (BGE-M3) + Sparse (BM25) + Reranker."""
     try:
         import torch
 
@@ -171,9 +135,6 @@ def buscar_fragmentos(
             return []
 
         query_rerank = (consulta_referencia or subconsultas_validas[0]).strip()
-
-        print(f"\n[DEBUG SEARCH] Subconsultas recibidas ({len(subconsultas_validas)}): {subconsultas_validas}")
-        print(f"[DEBUG SEARCH] Consulta de referencia para Reranker: '{query_rerank}'")
 
         filtro_region = models.Filter(
             must=[
@@ -220,8 +181,6 @@ def buscar_fragmentos(
         )
 
         puntos_fusionados = respuesta.points or []
-        print(f"[DEBUG SEARCH] Candidatos unificados tras RRF (Fase 1): {len(puntos_fusionados)}")
-
         if not puntos_fusionados:
             return []
 
@@ -268,14 +227,7 @@ def buscar_fragmentos(
             candidato["score"] = float(score_r)
 
         candidatos_ordenados = sorted(candidatos_rerank, key=lambda x: x["score"], reverse=True)
-
-        print(f"\n--- [EVALUACIÓN POST-RERANKING ({region.upper()})] ---")
-        fragmentos_finales = candidatos_ordenados[:top_k]
-        for f in fragmentos_finales:
-            print(
-                f"Doc: {f['documento']} | Pág: {f['pagina']} | Score Reranker: {f['score']:.4f} (RRF previo: {f['score_rrf']:.4f})")
-
-        return fragmentos_finales
+        return candidatos_ordenados[:top_k]
 
     except Exception as e:
         print(f"[ERROR BÚSQUEDA QDRANT + RERANKER] {e}")
@@ -312,7 +264,7 @@ def indexar_chunks_documento(puntos: List[models.PointStruct]):
 
 
 def precargar_modelos_en_segundo_plano():
-    """Ejecuta la precarga de modelos en segundo plano sin bloquear el servidor."""
+    """Ejecuta la precarga de modelos en segundo plano sin congelar la app."""
     try:
         print("\n[WARM-UP] Iniciando precarga silenciosa de modelos en segundo plano...")
         get_embedding_model()

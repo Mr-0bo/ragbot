@@ -1,11 +1,10 @@
 # ingestion/document_parser.py
+import time
 from io import BytesIO
-import os
 from pathlib import Path
 from typing import List, Dict, Union
 import fitz  # PyMuPDF
 
-# Instancia lazy de PaddleOCR para no consumir memoria al arrancar la app
 _ocr_engine = None
 
 
@@ -14,7 +13,10 @@ def _get_ocr_engine():
     if _ocr_engine is None:
         try:
             from paddleocr import PaddleOCR
-            _ocr_engine = PaddleOCR(use_angle_cls=True, lang="es")
+            try:
+                _ocr_engine = PaddleOCR(lang="es")
+            except Exception:
+                _ocr_engine = PaddleOCR(use_angle_cls=False, lang="es")
         except Exception as e:
             print(f"[WARN] No se pudo inicializar PaddleOCR: {e}")
             _ocr_engine = False
@@ -22,7 +24,7 @@ def _get_ocr_engine():
 
 
 def _extraer_tablas_pagina(page) -> str:
-    """Extrae tablas de la página usando la detección de tablas nativa de PyMuPDF."""
+    """Extrae tablas de la página usando la detección nativa de PyMuPDF."""
     markdown_tablas = []
     try:
         tabs = page.find_tables()
@@ -47,7 +49,7 @@ def _extraer_tablas_pagina(page) -> str:
 
 
 def _ejecutar_ocr_pagina(page) -> str:
-    """Renderiza la página a imagen a 150 DPI y ejecuta PaddleOCR optimizado en memoria."""
+    """Renderiza a 150 DPI y ejecuta PaddleOCR."""
     ocr = _get_ocr_engine()
     if not ocr:
         return ""
@@ -55,7 +57,7 @@ def _ejecutar_ocr_pagina(page) -> str:
     try:
         pix = page.get_pixmap(dpi=150)
         img_bytes = pix.tobytes("png")
-        resultado = ocr.ocr(img_bytes, cls=True)
+        resultado = ocr.ocr(img_bytes)
 
         del pix, img_bytes
 
@@ -70,36 +72,38 @@ def _ejecutar_ocr_pagina(page) -> str:
         return ""
 
 
-def extraer_markdown_de_pdf(ruta_pdf: Union[str, Path]) -> List[Dict]:
+def extraer_markdown_de_pdf(ruta_pdf: Union[str, Path], verbose: bool = True) -> List[Dict]:
     """
-    Extrae el contenido de un PDF página por página en formato estructurado Markdown.
-    Prioriza PyMuPDF nativo y reserva PaddleOCR estrictamente para páginas escaneadas reales.
+    Extrae contenido página por página reportando métricas de rendimiento por página.
     """
     ruta = Path(ruta_pdf)
     if not ruta.exists():
         raise FileNotFoundError(f"El archivo {ruta} no existe.")
 
     documento_paginas = []
+    t_inicio_doc = time.perf_counter()
 
     with fitz.open(ruta) as doc:
+        total_pags = len(doc)
+        if verbose:
+            print(f"\n[DEBUGGER PARSER] 📄 Abriendo '{ruta.name}' ({total_pags} págs)")
+
         for idx_pagina, page in enumerate(doc):
+            t_inicio_pag = time.perf_counter()
             numero_pagina = idx_pagina + 1
 
-            # 1. Extracción de texto vectorial nativo y detección de tablas
             texto_nativo = page.get_text("text").strip()
             tablas_md = _extraer_tablas_pagina(page)
 
             contenido_pagina = []
             metodo = "nativo"
 
-            # 2. Si la página tiene texto vectorial o tablas detectadas, no toca OCR
             if len(texto_nativo) >= 10 or tablas_md:
                 if tablas_md:
                     contenido_pagina.append(tablas_md)
                 if texto_nativo:
                     contenido_pagina.append(texto_nativo)
             else:
-                # 3. Solo evaluar OCR si no hay texto y existen imágenes incrustadas
                 if page.get_images():
                     texto_ocr = _ejecutar_ocr_pagina(page)
                     if texto_ocr:
@@ -111,12 +115,23 @@ def extraer_markdown_de_pdf(ruta_pdf: Union[str, Path]) -> List[Dict]:
                     contenido_pagina.append(texto_nativo)
 
             texto_final = "\n\n".join(contenido_pagina).strip()
+            duracion_pag_ms = (time.perf_counter() - t_inicio_pag) * 1000
 
             if texto_final:
                 documento_paginas.append({
                     "pagina": numero_pagina,
                     "texto": texto_final,
                     "metodo": metodo,
+                    "duracion_ms": round(duracion_pag_ms, 2),
+                    "caracteres": len(texto_final)
                 })
+
+            if verbose:
+                tag = "🔍 OCR" if metodo == "ocr" else "⚡ NATIVO"
+                print(f"  ├─ Pág {numero_pagina:02d}/{total_pags:02d} [{tag}] -> {len(texto_final)} chars en {duracion_pag_ms:.1f}ms")
+
+    duracion_total = time.perf_counter() - t_inicio_doc
+    if verbose:
+        print(f"  └─ Extracción terminada: {len(documento_paginas)}/{total_pags} págs válidas en {duracion_total:.2f}s")
 
     return documento_paginas
