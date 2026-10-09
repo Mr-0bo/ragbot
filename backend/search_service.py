@@ -18,7 +18,6 @@ _bge_m3_model: Optional[BGEM3FlagModel] = None
 
 
 def get_embedding_model() -> BGEM3FlagModel:
-    """Carga BAAI/bge-m3 con FlagEmbedding para soporte simultáneo Dense + Sparse."""
     global _bge_m3_model
     with _lock_modelos:
         if _bge_m3_model is None:
@@ -32,9 +31,10 @@ def get_embedding_model() -> BGEM3FlagModel:
                 dispositivo = "cpu"
 
             ruta_local = Path(settings.dense_model_path)
-            modelo_origen = str(ruta_local) if (ruta_local.exists() and any(ruta_local.iterdir())) else settings.EMBEDDING_MODEL_NAME
+            modelo_origen = str(ruta_local) if (
+                        ruta_local.exists() and any(ruta_local.iterdir())) else settings.EMBEDDING_MODEL_NAME
 
-            print(f"[INFO EMBEDDINGS] Inicializando BGE-M3 (Dense + Sparse nativo) en: {dispositivo.upper()}")
+            print(f"[INFO EMBEDDINGS] Inicializando BGE-M3 (Dense Only) en: {dispositivo.upper()}")
 
             _bge_m3_model = BGEM3FlagModel(
                 modelo_origen,
@@ -44,16 +44,15 @@ def get_embedding_model() -> BGEM3FlagModel:
     return _bge_m3_model
 
 
-# Funciones señuelo para evitar errores si algún archivo antiguo intenta importarlas
 def get_sparse_model():
     return None
+
 
 def get_reranker_model():
     return None
 
 
 def get_qdrant_client() -> QdrantClient:
-    """Inicializa la base de datos vectorial local."""
     global _qdrant_client
     with _lock_modelos:
         if _qdrant_client is None:
@@ -63,7 +62,6 @@ def get_qdrant_client() -> QdrantClient:
 
 
 def _inicializar_coleccion(client: QdrantClient):
-    """Crea la colección híbrida: Dense BGE-M3 (1024) + Sparse Lexical BGE-M3."""
     if not client.collection_exists(settings.QDRANT_COLLECTION_NAME):
         client.create_collection(
             collection_name=settings.QDRANT_COLLECTION_NAME,
@@ -72,14 +70,15 @@ def _inicializar_coleccion(client: QdrantClient):
                     size=DIMENSION_BGE_M3,
                     distance=models.Distance.COSINE
                 )
-            },
-            sparse_vectors_config={
-                "sparse": models.SparseVectorParams(
-                    index=models.SparseIndexParams(
-                        on_disk=False,
-                    )
-                )
             }
+            # --- MODO DISPERSO COMENTADO ---
+            # , sparse_vectors_config={
+            #     "sparse": models.SparseVectorParams(
+            #         index=models.SparseIndexParams(
+            #             on_disk=False,
+            #         )
+            #     )
+            # }
         )
 
 
@@ -92,7 +91,6 @@ def buscar_fragmentos(
         max_por_doc: int = 3,
         max_por_pagina: int = 2
 ) -> List[Dict]:
-    """Búsqueda Híbrida nativa: Dense + Sparse (Lexical) de BGE-M3 fusionados con RRF."""
     try:
         client = get_qdrant_client()
         modelo = get_embedding_model()
@@ -118,12 +116,14 @@ def buscar_fragmentos(
         prefetches: List[models.Prefetch] = []
 
         for sub_query in subconsultas_validas:
-            salida = modelo.encode([sub_query], return_dense=True, return_sparse=True)
+            # return_sparse=False para evitar cómputo innecesario
+            salida = modelo.encode([sub_query], return_dense=True, return_sparse=False)
             v_denso = salida["dense_vecs"][0].tolist()
-            lexical_dict = salida["lexical_weights"][0]
 
-            indices_sparse = [int(k) for k in lexical_dict.keys()]
-            values_sparse = [float(v) for v in lexical_dict.values()]
+            # --- MODO DISPERSO COMENTADO ---
+            # lexical_dict = salida["lexical_weights"][0]
+            # indices_sparse = [int(k) for k in lexical_dict.keys()]
+            # values_sparse = [float(v) for v in lexical_dict.values()]
 
             prefetches.append(
                 models.Prefetch(
@@ -133,27 +133,40 @@ def buscar_fragmentos(
                     filter=filtro_region
                 )
             )
-            if indices_sparse:
-                prefetches.append(
-                    models.Prefetch(
-                        query=models.SparseVector(
-                            indices=indices_sparse,
-                            values=values_sparse
-                        ),
-                        using="sparse",
-                        limit=recall_k * 2,
-                        filter=filtro_region
-                    )
-                )
 
-        respuesta = client.query_points(
-            collection_name=settings.QDRANT_COLLECTION_NAME,
-            prefetch=prefetches,
-            query=models.FusionQuery(fusion=models.Fusion.RRF),
-            query_filter=filtro_region,
-            limit=top_k * 3,
-            with_payload=True
-        )
+            # --- MODO DISPERSO COMENTADO ---
+            # if indices_sparse:
+            #     prefetches.append(
+            #         models.Prefetch(
+            #             query=models.SparseVector(
+            #                 indices=indices_sparse,
+            #                 values=values_sparse
+            #             ),
+            #             using="sparse",
+            #             limit=recall_k * 2,
+            #             filter=filtro_region
+            #         )
+            #     )
+
+        # Optimización: Búsqueda directa sin RRF si es una sola consulta
+        if len(prefetches) == 1:
+            respuesta = client.query_points(
+                collection_name=settings.QDRANT_COLLECTION_NAME,
+                query=prefetches[0].query,
+                using="dense",
+                query_filter=filtro_region,
+                limit=top_k * 3,
+                with_payload=True
+            )
+        else:
+            respuesta = client.query_points(
+                collection_name=settings.QDRANT_COLLECTION_NAME,
+                prefetch=prefetches,
+                query=models.FusionQuery(fusion=models.Fusion.RRF),
+                query_filter=filtro_region,
+                limit=top_k * 3,
+                with_payload=True
+            )
 
         puntos_fusionados = respuesta.points or []
         if not puntos_fusionados:
@@ -197,7 +210,7 @@ def buscar_fragmentos(
         return candidatos_finales
 
     except Exception as e:
-        print(f"[ERROR BÚSQUEDA QDRANT HÍBRIDA BGE-M3] {e}")
+        print(f"[ERROR BÚSQUEDA QDRANT DENSA BGE-M3] {e}")
         return []
 
 
@@ -230,9 +243,9 @@ def indexar_chunks_documento(puntos: List[models.PointStruct]):
 
 def precargar_modelos_en_segundo_plano():
     try:
-        print("\n[WARM-UP] Iniciando precarga silenciosa de BGE-M3 (Dense + Sparse)...")
+        print("\n[WARM-UP] Iniciando precarga silenciosa de BGE-M3 (Dense Only)...")
         get_embedding_model()
         get_qdrant_client()
-        print("[WARM-UP] BGE-M3 precargado exitosamente en RAM. Listo para inferencia híbrida.\n")
+        print("[WARM-UP] BGE-M3 precargado exitosamente. Listo.\n")
     except Exception as e:
         print(f"[WARM-UP WARN] Error en precarga: {e}")

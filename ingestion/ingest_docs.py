@@ -165,7 +165,6 @@ def procesar_e_indexar_archivo(
         region: str,
         embedding_model
 ) -> int:
-    """Extrae texto, vectoriza (BGE-M3 Dense + Sparse) y sube a Qdrant."""
     paginas = extraer_markdown_de_pdf(ruta_pdf, verbose=False)
     puntos_qdrant = []
     total_chunks = 0
@@ -190,7 +189,7 @@ def procesar_e_indexar_archivo(
     if not textos_chunk:
         return 0
 
-    lote_size = 16
+    lote_size = 4  # Cambiar a 16 o 32 en Mac M4
 
     for b in range(0, len(textos_chunk), lote_size):
         sub_lote = textos_chunk[b: b + lote_size]
@@ -199,29 +198,35 @@ def procesar_e_indexar_archivo(
             batch_size=lote_size,
             max_length=512,
             return_dense=True,
-            return_sparse=True
+            return_sparse=False  # --- MODO DISPERSO COMENTADO ---
         )
 
         v_densos = salida["dense_vecs"]
-        v_lexical = salida["lexical_weights"]
+
+        # --- MODO DISPERSO COMENTADO ---
+        # v_lexical = salida["lexical_weights"]
 
         for sub_i, meta_idx in enumerate(range(b, b + len(sub_lote))):
             meta = metadatos_chunk[meta_idx]
             point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{ruta_rel}_{meta['pagina']}_{meta['sub_idx']}"))
 
-            lexical_dict = v_lexical[sub_i]
-            indices = [int(k) for k in lexical_dict.keys()]
-            values = [float(v) for v in lexical_dict.values()]
+            # --- MODO DISPERSO COMENTADO ---
+            # lexical_dict = v_lexical[sub_i]
+            # indices = [int(k) for k in lexical_dict.keys()]
+            # values = [float(v) for v in lexical_dict.values()]
+            # vector_hibrido = {
+            #     "dense": v_densos[sub_i].tolist(),
+            #     "sparse": models.SparseVector(indices=indices, values=values)
+            # }
 
-            vector_hibrido = {
-                "dense": v_densos[sub_i].tolist(),
-                "sparse": models.SparseVector(indices=indices, values=values)
+            vector_payload = {
+                "dense": v_densos[sub_i].tolist()
             }
 
             puntos_qdrant.append(
                 models.PointStruct(
                     id=point_id,
-                    vector=vector_hibrido,
+                    vector=vector_payload,
                     payload={
                         "documento": ruta_pdf.name,
                         "ruta_relativa": ruta_rel,

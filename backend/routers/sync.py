@@ -18,7 +18,6 @@ router = APIRouter(prefix="/api/sync", tags=["Sincronización"])
 
 
 def recopilar_archivos_pdf(carpetas: List[str]) -> List[Path]:
-    """Busca recursivamente archivos .pdf en las carpetas seleccionadas."""
     pdfs = []
     for c in carpetas:
         if not c:
@@ -32,7 +31,6 @@ def recopilar_archivos_pdf(carpetas: List[str]) -> List[Path]:
 
 
 def calcular_hash_archivo(ruta: Path) -> str:
-    """Calcula el hash MD5 para control de cambios e indexación incremental."""
     hasher = hashlib.md5()
     with open(ruta, "rb") as f:
         for chunk in iter(lambda: f.read(65536), b""):
@@ -81,13 +79,6 @@ def verificar_cambios_pendientes(db: Session = Depends(get_db)):
 
 
 def procesar_e_indexar_pdf(archivo: Path, region: str, db: Session) -> Dict[str, Any]:
-    """
-    Pipeline instrumentado:
-    1. Parseo/OCR (PyMuPDF / PaddleOCR)
-    2. Chunking Recursivo
-    3. Inferencia de Embeddings Híbrida (Dense + Sparse BGE-M3 nativo)
-    4. Upsert en Qdrant + SQLite
-    """
     import torch
     from backend.search_service import (
         get_embedding_model,
@@ -109,13 +100,11 @@ def procesar_e_indexar_pdf(archivo: Path, region: str, db: Session) -> Dict[str,
         print(f"[DEBUGGER] ⏭️ Omitiendo '{nombre}' (Sin cambios)")
         return {"omitido": True, "nombre": nombre}
 
-    # 1. Extracción de texto
     t0_parse = time.perf_counter()
     paginas = extraer_markdown_de_pdf(archivo, verbose=True)
     t_parse = time.perf_counter() - t0_parse
     total_paginas = len(paginas)
 
-    # 2. Segmentación / Chunking
     t0_chunk = time.perf_counter()
     textos_chunk = []
     metadatos_chunk = []
@@ -141,14 +130,8 @@ def procesar_e_indexar_pdf(archivo: Path, region: str, db: Session) -> Dict[str,
 
     t_chunk = time.perf_counter() - t0_chunk
 
-    print(f"\n[DEBUGGER CHUNKS] ✂️ '{nombre}': {len(textos_chunk)} fragmentos creados en {t_chunk * 1000:.1f}ms")
-    for i, meta in enumerate(metadatos_chunk[:3]):
-        preview = meta['texto'][:80].replace("\n", " ")
-        print(f"   ├─ Chunk #{i + 1:02d} (Pág {meta['pagina']}) [{meta['caracteres']} chars]: \"{preview}...\"")
-    if len(metadatos_chunk) > 3:
-        print(f"   └─ ... y {len(metadatos_chunk) - 3} chunks adicionales.")
+    print(f"\n[DEBUGGER CHUNKS] ✂️ '{nombre}': {len(textos_chunk)} fragmentos creados.")
 
-    # 3. Vectorización Híbrida BGE-M3 (Dense + Sparse en una sola pasada)
     t_vectorizacion = 0.0
     t_qdrant = 0.0
 
@@ -156,10 +139,10 @@ def procesar_e_indexar_pdf(archivo: Path, region: str, db: Session) -> Dict[str,
         modelo = get_embedding_model()
         eliminar_documento_por_ruta(ruta_abs)
 
-        lote_size = 16
+        lote_size = 4  # Cambiar a 16 o 32 en Mac M4
         puntos_qdrant = []
 
-        print(f"\n[DEBUGGER INFERENCIA] 🧠 Vectorizando {len(textos_chunk)} chunks con BGE-M3 (Dense + Sparse)...")
+        print(f"\n[DEBUGGER INFERENCIA] 🧠 Vectorizando {len(textos_chunk)} chunks con BGE-M3 (Dense Only)...")
 
         for b in range(0, len(textos_chunk), lote_size):
             sub_lote = textos_chunk[b: b + lote_size]
@@ -170,31 +153,35 @@ def procesar_e_indexar_pdf(archivo: Path, region: str, db: Session) -> Dict[str,
                 batch_size=lote_size,
                 max_length=512,
                 return_dense=True,
-                return_sparse=True
+                return_sparse=False  # --- MODO DISPERSO COMENTADO ---
             )
             t_vectorizacion += (time.perf_counter() - t0_v)
 
             v_densos = salida["dense_vecs"]
-            v_lexical = salida["lexical_weights"]
+            # --- MODO DISPERSO COMENTADO ---
+            # v_lexical = salida["lexical_weights"]
 
             for sub_i, meta_idx in enumerate(range(b, b + len(sub_lote))):
                 meta = metadatos_chunk[meta_idx]
                 point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{ruta_abs}_{meta['pagina']}_{meta['sub_idx']}"))
 
-                # Conversión de pesos léxicos al formato SparseVector de Qdrant
-                lexical_dict = v_lexical[sub_i]
-                indices = [int(k) for k in lexical_dict.keys()]
-                values = [float(v) for v in lexical_dict.values()]
+                # --- MODO DISPERSO COMENTADO ---
+                # lexical_dict = v_lexical[sub_i]
+                # indices = [int(k) for k in lexical_dict.keys()]
+                # values = [float(v) for v in lexical_dict.values()]
+                # vector_hibrido = {
+                #     "dense": v_densos[sub_i].tolist(),
+                #     "sparse": models.SparseVector(indices=indices, values=values)
+                # }
 
-                vector_hibrido = {
-                    "dense": v_densos[sub_i].tolist(),
-                    "sparse": models.SparseVector(indices=indices, values=values)
+                vector_payload = {
+                    "dense": v_densos[sub_i].tolist()
                 }
 
                 puntos_qdrant.append(
                     models.PointStruct(
                         id=point_id,
-                        vector=vector_hibrido,
+                        vector=vector_payload,
                         payload={
                             "documento": nombre,
                             "ruta_relativa": ruta_abs,
@@ -206,7 +193,6 @@ def procesar_e_indexar_pdf(archivo: Path, region: str, db: Session) -> Dict[str,
                     )
                 )
 
-        # 4. Inserción en Qdrant
         t0_qdrant = time.perf_counter()
         indexar_chunks_documento(puntos_qdrant)
         t_qdrant = time.perf_counter() - t0_qdrant
@@ -218,7 +204,6 @@ def procesar_e_indexar_pdf(archivo: Path, region: str, db: Session) -> Dict[str,
             torch.mps.empty_cache()
         gc.collect()
 
-    # 5. Persistencia SQLite
     if not doc_db:
         doc_db = DocumentoNormativo(
             id=str(uuid.uuid4()),
@@ -239,18 +224,7 @@ def procesar_e_indexar_pdf(archivo: Path, region: str, db: Session) -> Dict[str,
 
     duracion_total = time.perf_counter() - t_inicio_total
 
-    print(f"""
-╔═══════════════════════════════════════════════════════════════════╗
-║ TELEMETRÍA DE INDEXACIÓN: {nombre[:38]:<39} ║
-╠═══════════════════════════════════════════════════════════════════╣
-║  • Páginas procesadas    : {total_paginas:<6} ({t_parse:.2f} s)                    ║
-║  • Chunks generados      : {chunk_index:<6} ({t_chunk * 1000:.1f} ms)                 ║
-║  • Inferencia Híbrida    : {t_vectorizacion:.2f} s                              ║
-║  • Inserción Qdrant      : {t_qdrant:.2f} s                              ║
-║  ───────────────────────────────────────────────────────────────  ║
-║  ⏱️ TIEMPO TOTAL          : {duracion_total:.2f} s                              ║
-╚═══════════════════════════════════════════════════════════════════╝
-""")
+    print(f"⏱️ TIEMPO TOTAL: {duracion_total:.2f} s (Inferencia Densa: {t_vectorizacion:.2f} s)")
 
     return {
         "omitido": False,
@@ -260,17 +234,12 @@ def procesar_e_indexar_pdf(archivo: Path, region: str, db: Session) -> Dict[str,
         "tiempo_total_s": round(duracion_total, 2),
         "tiempo_parse_s": round(t_parse, 2),
         "tiempo_chunk_ms": round(t_chunk * 1000, 2),
-        "tiempo_hibrido_s": round(t_vectorizacion, 2),
-        "tiempo_qdrant_s": round(t_qdrant, 2),
-        "ejemplos_chunks": [
-            {"chunk_id": idx + 1, "pagina": m["pagina"], "chars": m["caracteres"], "texto": m["texto"][:120]}
-            for idx, m in enumerate(metadatos_chunk[:5])
-        ]
+        "tiempo_vector_s": round(t_vectorizacion, 2),
+        "tiempo_qdrant_s": round(t_qdrant, 2)
     }
 
 
 def generador_indexacion_sse():
-    """Emite eventos SSE de progreso y paquetes de telemetría detallada."""
     db = SessionLocal()
     try:
         config = db.query(ConfiguracionApp).first()
