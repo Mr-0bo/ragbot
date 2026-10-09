@@ -1,10 +1,11 @@
+# ingestion/ingest_docs.py
 import os
 import re
 import time
 import uuid
 import hashlib
 from pathlib import Path
-from typing import Callable, Optional, Generator, List
+from typing import Callable, Optional, List
 from qdrant_client.http import models
 
 from backend.config import settings
@@ -13,13 +14,11 @@ from ingestion.document_parser import extraer_markdown_de_pdf
 from backend.search_service import (
     eliminar_documento_por_ruta,
     indexar_chunks_documento,
-    get_embedding_model,
-    get_sparse_model,
+    get_embedding_model
 )
 
 
 def calcular_hash_md5(ruta_archivo: Path) -> str:
-    """Calcula el hash MD5 de un archivo leyendo en bloques."""
     hasher = hashlib.md5()
     with open(ruta_archivo, "rb") as f:
         while chunk := f.read(65536):
@@ -28,7 +27,6 @@ def calcular_hash_md5(ruta_archivo: Path) -> str:
 
 
 def forzar_hidratacion_onedrive(ruta_pdf: Path, timeout_segundos: int = 45) -> bool:
-    """Fuerza la descarga de archivos 'Files On-Demand' de OneDrive."""
     if os.name == "nt":
         os.system(f'attrib -U "{ruta_pdf}" >nul 2>&1')
 
@@ -46,7 +44,6 @@ def forzar_hidratacion_onedrive(ruta_pdf: Path, timeout_segundos: int = 45) -> b
 
 
 def limpiar_texto(texto: str) -> str:
-    """Normaliza espacios horizontales conservando párrafos y estructura Markdown."""
     texto = re.sub(r"[ \t]+", " ", texto)
     texto = re.sub(r"\n\s*\n+", "\n\n", texto)
     return texto.strip()
@@ -58,11 +55,6 @@ def dividir_en_chunks(
         overlap: int = 200,
         separadores: Optional[List[str]] = None
 ) -> List[str]:
-    """
-    Recursive Character Text Splitter nativo.
-    Divide recursivamente por párrafos, saltos de línea, oraciones y palabras,
-    preservando la integridad semántica de tablas y enunciados normativos.
-    """
     if not texto or not texto.strip():
         return []
 
@@ -87,7 +79,6 @@ def dividir_en_chunks(
                 if bloque_actual:
                     bloques.append(bloque_actual.strip())
                 if len(parte) > chunk_size:
-                    # Si un segmento supera el límite por sí mismo, profundizar separador
                     sub_bloques = _split_recursivo(parte, separador_idx + 1)
                     bloques.extend(sub_bloques)
                     bloque_actual = ""
@@ -101,7 +92,6 @@ def dividir_en_chunks(
 
     bloques_base = _split_recursivo(texto.strip(), 0)
 
-    # Aplicar solapamiento (overlap) contextual controlado
     chunks_finales = []
     for i, bloque in enumerate(bloques_base):
         if i == 0 or overlap <= 0:
@@ -109,7 +99,6 @@ def dividir_en_chunks(
         else:
             prev_texto = bloques_base[i - 1]
             corte_overlap = prev_texto[-overlap:]
-            # Evitar cortar una palabra a la mitad en el borde de solapamiento
             primer_espacio = corte_overlap.find(" ")
             if primer_espacio != -1:
                 corte_overlap = corte_overlap[primer_espacio + 1:]
@@ -121,10 +110,6 @@ def dividir_en_chunks(
 
 
 def auditar_directorio(directorio_raiz: Path, region: str = "mexico") -> dict:
-    """
-    Escanea la carpeta de OneDrive buscando únicamente PDFs dentro de '2025-2026',
-    compara contra SQLite y clasifica en nuevos, modificados, sin_cambios y eliminados.
-    """
     db = SessionLocal()
     try:
         registros_bd = {
@@ -143,7 +128,6 @@ def auditar_directorio(directorio_raiz: Path, region: str = "mexico") -> dict:
             if pdf.name.startswith("~") or pdf.name.startswith("."):
                 continue
 
-            # Filtro estricto de periodo de vigencia
             if settings.CARPETA_VIGENCIA.lower() not in str(pdf).lower():
                 continue
 
@@ -151,7 +135,6 @@ def auditar_directorio(directorio_raiz: Path, region: str = "mexico") -> dict:
             encontrados_en_disco.add(ruta_rel)
 
             if not forzar_hidratacion_onedrive(pdf):
-                print(f"[WARN] No se pudo asegurar la hidratación de: {pdf.name}")
                 continue
 
             hash_actual = calcular_hash_md5(pdf)
@@ -180,11 +163,10 @@ def procesar_e_indexar_archivo(
         ruta_rel: str,
         hash_md5: str,
         region: str,
-        embedding_model,
-        sparse_model
+        embedding_model
 ) -> int:
-    """Extrae texto con PyMuPDF/PaddleOCR, vectoriza (BGE-M3 + BM25) y sube a Qdrant."""
-    paginas = extraer_markdown_de_pdf(ruta_pdf)
+    """Extrae texto, vectoriza (BGE-M3 Dense + Sparse) y sube a Qdrant."""
+    paginas = extraer_markdown_de_pdf(ruta_pdf, verbose=False)
     puntos_qdrant = []
     total_chunks = 0
 
@@ -208,46 +190,50 @@ def procesar_e_indexar_archivo(
     if not textos_chunk:
         return 0
 
-    # Inferencia de embeddings por lotes para mantener estabilidad de memoria
-    lote_size = 32
-    vectores_densos = []
-    vectores_dispersos = []
+    lote_size = 16
 
     for b in range(0, len(textos_chunk), lote_size):
         sub_lote = textos_chunk[b: b + lote_size]
-        vectores_densos.extend(list(embedding_model.embed(sub_lote)))
-        vectores_dispersos.extend(list(sparse_model.embed(sub_lote)))
-
-    for meta, v_denso, v_disperso in zip(metadatos_chunk, vectores_densos, vectores_dispersos):
-        # UUID determinista basado en ruta y fragmento
-        point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{ruta_rel}_{meta['pagina']}_{meta['sub_idx']}"))
-
-        vector_hibrido = {
-            "dense": v_denso.tolist(),
-            "sparse": models.SparseVector(
-                indices=v_disperso.indices.tolist(),
-                values=v_disperso.values.tolist()
-            )
-        }
-
-        puntos_qdrant.append(
-            models.PointStruct(
-                id=point_id,
-                vector=vector_hibrido,
-                payload={
-                    "documento": ruta_pdf.name,
-                    "ruta_relativa": ruta_rel,
-                    "pagina": meta["pagina"],
-                    "contenido": meta["texto"],
-                    "region": region.lower(),
-                },
-            )
+        salida = embedding_model.encode(
+            sub_lote,
+            batch_size=lote_size,
+            max_length=512,
+            return_dense=True,
+            return_sparse=True
         )
 
-    # Inserción en Qdrant
+        v_densos = salida["dense_vecs"]
+        v_lexical = salida["lexical_weights"]
+
+        for sub_i, meta_idx in enumerate(range(b, b + len(sub_lote))):
+            meta = metadatos_chunk[meta_idx]
+            point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{ruta_rel}_{meta['pagina']}_{meta['sub_idx']}"))
+
+            lexical_dict = v_lexical[sub_i]
+            indices = [int(k) for k in lexical_dict.keys()]
+            values = [float(v) for v in lexical_dict.values()]
+
+            vector_hibrido = {
+                "dense": v_densos[sub_i].tolist(),
+                "sparse": models.SparseVector(indices=indices, values=values)
+            }
+
+            puntos_qdrant.append(
+                models.PointStruct(
+                    id=point_id,
+                    vector=vector_hibrido,
+                    payload={
+                        "documento": ruta_pdf.name,
+                        "ruta_relativa": ruta_rel,
+                        "pagina": meta["pagina"],
+                        "contenido": meta["texto"],
+                        "region": region.lower(),
+                    },
+                )
+            )
+
     indexar_chunks_documento(puntos_qdrant)
 
-    # Actualizar registro en SQLite
     db = SessionLocal()
     try:
         doc = db.query(DocumentoNormativo).filter(DocumentoNormativo.ruta_relativa == ruta_rel).first()
@@ -287,12 +273,6 @@ def sincronizar_directorio(
         region: str = "mexico",
         callback_progreso: Optional[Callable[[int, int, str], None]] = None,
 ) -> dict:
-    """
-    Sincroniza una carpeta de OneDrive:
-    1. Audita cambios
-    2. Purga eliminados y modificados en Qdrant
-    3. Procesa e indexa únicamente nuevos y modificados (Híbrido)
-    """
     directorio_raiz = Path(directorio).expanduser().resolve()
     if not directorio_raiz.exists():
         raise FileNotFoundError(f"La ruta no existe: {directorio_raiz}")
@@ -300,7 +280,6 @@ def sincronizar_directorio(
     auditoria = auditar_directorio(directorio_raiz, region=region)
     db = SessionLocal()
 
-    # 1. Purgar eliminados
     try:
         for ruta_rel in auditoria["eliminados"]:
             eliminar_documento_por_ruta(ruta_rel)
@@ -309,23 +288,20 @@ def sincronizar_directorio(
     finally:
         db.close()
 
-    # 2. Purgar modificados en Qdrant antes de reindexar
     for _, ruta_rel, _ in auditoria["modificados"]:
         eliminar_documento_por_ruta(ruta_rel)
 
-    # 3. Procesar nuevos y modificados
     a_procesar = auditoria["nuevos"] + auditoria["modificados"]
     total = len(a_procesar)
 
     modelo_embedding = get_embedding_model()
-    modelo_disperso = get_sparse_model()
 
     chunks_totales = 0
     for idx, (pdf, ruta_rel, hash_md5) in enumerate(a_procesar, start=1):
         if callback_progreso:
             callback_progreso(idx, total, pdf.name)
 
-        chunks = procesar_e_indexar_archivo(pdf, ruta_rel, hash_md5, region, modelo_embedding, modelo_disperso)
+        chunks = procesar_e_indexar_archivo(pdf, ruta_rel, hash_md5, region, modelo_embedding)
         chunks_totales += chunks
 
     return {
@@ -339,7 +315,6 @@ def sincronizar_directorio(
 
 if __name__ == "__main__":
     carpeta_prueba = Path("./data")
-    print(f"Probando escaneo en {carpeta_prueba.resolve()}...")
     if carpeta_prueba.exists():
         res = sincronizar_directorio(carpeta_prueba, region="mexico")
         print(f"Resultado de sincronización: {res}")

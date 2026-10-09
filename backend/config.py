@@ -22,10 +22,8 @@ class Settings(BaseSettings):
     def GEMINI_MODEL(self) -> str:
         return self.GEMINI_MODEL_SYNTHESIS
 
-    # Nombres de identificador
+    # Modelo unificado BGE-M3 (Dense + Sparse nativo)
     EMBEDDING_MODEL_NAME: str = "BAAI/bge-m3"
-    SPARSE_MODEL_NAME: str = "Qdrant/bm25"
-    RERANKER_MODEL_NAME: str = "BAAI/bge-reranker-base"
 
     APP_NAME: str = "CopilotoNormativas"
     APP_AUTHOR: str = "ArquitecturaSistemas"
@@ -69,10 +67,6 @@ class Settings(BaseSettings):
     @property
     def dense_model_path(self) -> Path:
         return self.models_cache_dir / "bge-m3"
-
-    @property
-    def fastembed_cache_dir(self) -> Path:
-        return self.models_cache_dir / "fastembed_cache"
 
 
 try:

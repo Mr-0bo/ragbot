@@ -21,7 +21,7 @@ google-genai
 # 🔍 BASE DE DATOS VECTORIAL Y EMBEDDINGS
 # ==========================================
 qdrant-client
-fastembed
+FlagEmbedding
 
 # ==========================================
 # 📄 PROCESAMIENTO DE DOCUMENTOS (PDF Y OCR)
@@ -30,7 +30,6 @@ pymupdf
 paddleocr
 paddlepaddle
 pillow
-sentence-transformers
 
 # ==========================================
 # 🛠️ UTILIDADES DEL SISTEMA

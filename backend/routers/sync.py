@@ -85,14 +85,12 @@ def procesar_e_indexar_pdf(archivo: Path, region: str, db: Session) -> Dict[str,
     Pipeline instrumentado:
     1. Parseo/OCR (PyMuPDF / PaddleOCR)
     2. Chunking Recursivo
-    3. Inferencia de Embeddings (Dense BGE-M3 + Sparse BM25)
+    3. Inferencia de Embeddings Híbrida (Dense + Sparse BGE-M3 nativo)
     4. Upsert en Qdrant + SQLite
-    Retorna métricas de telemetría y muestra resumen en consola.
     """
     import torch
     from backend.search_service import (
         get_embedding_model,
-        get_sparse_model,
         indexar_chunks_documento,
         eliminar_documento_por_ruta
     )
@@ -143,88 +141,77 @@ def procesar_e_indexar_pdf(archivo: Path, region: str, db: Session) -> Dict[str,
 
     t_chunk = time.perf_counter() - t0_chunk
 
-    # Muestra visual en consola de los chunks
-    print(f"\n[DEBUGGER CHUNKS] ✂️ '{nombre}': {len(textos_chunk)} fragmentos creados en {t_chunk*1000:.1f}ms")
-    for i, meta in enumerate(metadatos_chunk[:3]):  # Mostrar los primeros 3 chunks como muestra
+    print(f"\n[DEBUGGER CHUNKS] ✂️ '{nombre}': {len(textos_chunk)} fragmentos creados en {t_chunk * 1000:.1f}ms")
+    for i, meta in enumerate(metadatos_chunk[:3]):
         preview = meta['texto'][:80].replace("\n", " ")
-        print(f"   ├─ Chunk #{i+1:02d} (Pág {meta['pagina']}) [{meta['caracteres']} chars]: \"{preview}...\"")
+        print(f"   ├─ Chunk #{i + 1:02d} (Pág {meta['pagina']}) [{meta['caracteres']} chars]: \"{preview}...\"")
     if len(metadatos_chunk) > 3:
         print(f"   └─ ... y {len(metadatos_chunk) - 3} chunks adicionales.")
 
-    # 3. Vectorización
-    t_dense = 0.0
-    t_sparse = 0.0
+    # 3. Vectorización Híbrida BGE-M3 (Dense + Sparse en una sola pasada)
+    t_vectorizacion = 0.0
     t_qdrant = 0.0
 
     if textos_chunk:
-        modelo_denso = get_embedding_model()
-        modelo_disperso = get_sparse_model()
-
+        modelo = get_embedding_model()
         eliminar_documento_por_ruta(ruta_abs)
 
         lote_size = 16
-        v_densos = []
-        v_dispersos = []
+        puntos_qdrant = []
 
-        print(f"\n[DEBUGGER INFERENCIA] 🧠 Vectorizando {len(textos_chunk)} chunks en lotes de {lote_size}...")
+        print(f"\n[DEBUGGER INFERENCIA] 🧠 Vectorizando {len(textos_chunk)} chunks con BGE-M3 (Dense + Sparse)...")
 
-        with torch.inference_mode():
-            for b in range(0, len(textos_chunk), lote_size):
-                sub_lote = textos_chunk[b: b + lote_size]
+        for b in range(0, len(textos_chunk), lote_size):
+            sub_lote = textos_chunk[b: b + lote_size]
 
-                t0_d = time.perf_counter()
-                vectores_lote = modelo_denso.encode(
-                    sub_lote,
-                    batch_size=lote_size,
-                    show_progress_bar=False,
-                    normalize_embeddings=True
+            t0_v = time.perf_counter()
+            salida = modelo.encode(
+                sub_lote,
+                batch_size=lote_size,
+                max_length=512,
+                return_dense=True,
+                return_sparse=True
+            )
+            t_vectorizacion += (time.perf_counter() - t0_v)
+
+            v_densos = salida["dense_vecs"]
+            v_lexical = salida["lexical_weights"]
+
+            for sub_i, meta_idx in enumerate(range(b, b + len(sub_lote))):
+                meta = metadatos_chunk[meta_idx]
+                point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{ruta_abs}_{meta['pagina']}_{meta['sub_idx']}"))
+
+                # Conversión de pesos léxicos al formato SparseVector de Qdrant
+                lexical_dict = v_lexical[sub_i]
+                indices = [int(k) for k in lexical_dict.keys()]
+                values = [float(v) for v in lexical_dict.values()]
+
+                vector_hibrido = {
+                    "dense": v_densos[sub_i].tolist(),
+                    "sparse": models.SparseVector(indices=indices, values=values)
+                }
+
+                puntos_qdrant.append(
+                    models.PointStruct(
+                        id=point_id,
+                        vector=vector_hibrido,
+                        payload={
+                            "documento": nombre,
+                            "ruta_relativa": ruta_abs,
+                            "ruta_absoluta": ruta_abs,
+                            "pagina": meta["pagina"],
+                            "contenido": meta["texto"],
+                            "region": region.lower()
+                        }
+                    )
                 )
-                t_dense += (time.perf_counter() - t0_d)
-                v_densos.extend(vectores_lote)
-
-                if modelo_disperso:
-                    t0_s = time.perf_counter()
-                    v_dispersos.extend(list(modelo_disperso.embed(sub_lote)))
-                    t_sparse += (time.perf_counter() - t0_s)
 
         # 4. Inserción en Qdrant
         t0_qdrant = time.perf_counter()
-        puntos_qdrant = []
-        for i, meta in enumerate(metadatos_chunk):
-            point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{ruta_abs}_{meta['pagina']}_{meta['sub_idx']}"))
-            dense_vector = v_densos[i].tolist() if hasattr(v_densos[i], "tolist") else list(v_densos[i])
-
-            if modelo_disperso and i < len(v_dispersos):
-                vs = v_dispersos[i]
-                vector_payload = {
-                    "dense": dense_vector,
-                    "sparse": models.SparseVector(
-                        indices=vs.indices.tolist(),
-                        values=vs.values.tolist()
-                    )
-                }
-            else:
-                vector_payload = {"dense": dense_vector}
-
-            puntos_qdrant.append(
-                models.PointStruct(
-                    id=point_id,
-                    vector=vector_payload,
-                    payload={
-                        "documento": nombre,
-                        "ruta_relativa": ruta_abs,
-                        "ruta_absoluta": ruta_abs,
-                        "pagina": meta["pagina"],
-                        "contenido": meta["texto"],
-                        "region": region.lower()
-                    }
-                )
-            )
-
         indexar_chunks_documento(puntos_qdrant)
         t_qdrant = time.perf_counter() - t0_qdrant
 
-        del v_densos, v_dispersos, puntos_qdrant
+        del salida, puntos_qdrant
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         elif sys.platform == "darwin" and torch.backends.mps.is_available():
@@ -252,15 +239,13 @@ def procesar_e_indexar_pdf(archivo: Path, region: str, db: Session) -> Dict[str,
 
     duracion_total = time.perf_counter() - t_inicio_total
 
-    # Resumen estructurado del archivo
     print(f"""
 ╔═══════════════════════════════════════════════════════════════════╗
 ║ TELEMETRÍA DE INDEXACIÓN: {nombre[:38]:<39} ║
 ╠═══════════════════════════════════════════════════════════════════╣
 ║  • Páginas procesadas    : {total_paginas:<6} ({t_parse:.2f} s)                    ║
-║  • Chunks generados      : {chunk_index:<6} ({t_chunk*1000:.1f} ms)                 ║
-║  • Inferencia BGE-M3     : {t_dense:.2f} s                              ║
-║  • Inferencia BM25       : {t_sparse:.2f} s                              ║
+║  • Chunks generados      : {chunk_index:<6} ({t_chunk * 1000:.1f} ms)                 ║
+║  • Inferencia Híbrida    : {t_vectorizacion:.2f} s                              ║
 ║  • Inserción Qdrant      : {t_qdrant:.2f} s                              ║
 ║  ───────────────────────────────────────────────────────────────  ║
 ║  ⏱️ TIEMPO TOTAL          : {duracion_total:.2f} s                              ║
@@ -275,8 +260,7 @@ def procesar_e_indexar_pdf(archivo: Path, region: str, db: Session) -> Dict[str,
         "tiempo_total_s": round(duracion_total, 2),
         "tiempo_parse_s": round(t_parse, 2),
         "tiempo_chunk_ms": round(t_chunk * 1000, 2),
-        "tiempo_denso_s": round(t_dense, 2),
-        "tiempo_sparse_s": round(t_sparse, 2),
+        "tiempo_hibrido_s": round(t_vectorizacion, 2),
         "tiempo_qdrant_s": round(t_qdrant, 2),
         "ejemplos_chunks": [
             {"chunk_id": idx + 1, "pagina": m["pagina"], "chars": m["caracteres"], "texto": m["texto"][:120]}
@@ -315,7 +299,6 @@ def generador_indexacion_sse():
 
             try:
                 metricas = procesar_e_indexar_pdf(archivo, region=config.region or "mexico", db=db)
-                # Envío de métricas al cliente
                 yield f"data: {json.dumps({'tipo': 'telemetria', 'datos': metricas})}\n\n"
             except Exception as e:
                 print(f"[WARN INDEX] Error al indexar {nombre}: {e}")

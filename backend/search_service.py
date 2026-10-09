@@ -6,8 +6,7 @@ from typing import List, Dict, Optional, Union
 from pathlib import Path
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
-from fastembed import SparseTextEmbedding
-from fastembed.rerank.cross_encoder import TextCrossEncoder
+from FlagEmbedding import BGEM3FlagModel
 from backend.config import settings
 
 DIMENSION_BGE_M3 = 1024
@@ -15,18 +14,15 @@ DIMENSION_BGE_M3 = 1024
 _lock_modelos = threading.Lock()
 
 _qdrant_client: Optional[QdrantClient] = None
-_embedding_model = None
-_sparse_model: Optional[SparseTextEmbedding] = None
-_reranker_model: Optional[TextCrossEncoder] = None
+_bge_m3_model: Optional[BGEM3FlagModel] = None
 
 
-def get_embedding_model():
-    """Carga BAAI/bge-m3; si no está local, lo descarga automáticamente."""
-    global _embedding_model
+def get_embedding_model() -> BGEM3FlagModel:
+    """Carga BAAI/bge-m3 con FlagEmbedding para soporte simultáneo Dense + Sparse."""
+    global _bge_m3_model
     with _lock_modelos:
-        if _embedding_model is None:
+        if _bge_m3_model is None:
             import torch
-            from sentence_transformers import SentenceTransformer
 
             if torch.cuda.is_available():
                 dispositivo = "cuda"
@@ -34,47 +30,26 @@ def get_embedding_model():
                 dispositivo = "mps"
             else:
                 dispositivo = "cpu"
-                cpus = os.cpu_count() or 4
-                torch.set_num_threads(cpus)
 
             ruta_local = Path(settings.dense_model_path)
             modelo_origen = str(ruta_local) if (ruta_local.exists() and any(ruta_local.iterdir())) else settings.EMBEDDING_MODEL_NAME
 
-            print(f"[INFO EMBEDDINGS] Inicializando {modelo_origen} en: {dispositivo.upper()}")
+            print(f"[INFO EMBEDDINGS] Inicializando BGE-M3 (Dense + Sparse nativo) en: {dispositivo.upper()}")
 
-            _embedding_model = SentenceTransformer(
+            _bge_m3_model = BGEM3FlagModel(
                 modelo_origen,
+                use_fp16=(dispositivo in ["cuda", "mps"]),
                 device=dispositivo
             )
-            _embedding_model.max_seq_length = 512
-
-    return _embedding_model
+    return _bge_m3_model
 
 
-def get_sparse_model() -> SparseTextEmbedding:
-    """Carga BM25 con descarga automática gestionada por FastEmbed si falta."""
-    global _sparse_model
-    with _lock_modelos:
-        if _sparse_model is None:
-            cache_path = str(settings.fastembed_cache_dir)
-            _sparse_model = SparseTextEmbedding(
-                model_name=settings.SPARSE_MODEL_NAME,
-                cache_dir=cache_path
-            )
-    return _sparse_model
+# Funciones señuelo para evitar errores si algún archivo antiguo intenta importarlas
+def get_sparse_model():
+    return None
 
-
-def get_reranker_model() -> TextCrossEncoder:
-    """Carga el Reranker con descarga automática gestionada por FastEmbed si falta."""
-    global _reranker_model
-    with _lock_modelos:
-        if _reranker_model is None:
-            cache_path = str(settings.fastembed_cache_dir)
-            _reranker_model = TextCrossEncoder(
-                model_name=settings.RERANKER_MODEL_NAME,
-                cache_dir=cache_path
-            )
-    return _reranker_model
+def get_reranker_model():
+    return None
 
 
 def get_qdrant_client() -> QdrantClient:
@@ -88,7 +63,7 @@ def get_qdrant_client() -> QdrantClient:
 
 
 def _inicializar_coleccion(client: QdrantClient):
-    """Crea la colección híbrida si no existe."""
+    """Crea la colección híbrida: Dense BGE-M3 (1024) + Sparse Lexical BGE-M3."""
     if not client.collection_exists(settings.QDRANT_COLLECTION_NAME):
         client.create_collection(
             collection_name=settings.QDRANT_COLLECTION_NAME,
@@ -117,13 +92,10 @@ def buscar_fragmentos(
         max_por_doc: int = 3,
         max_por_pagina: int = 2
 ) -> List[Dict]:
-    """Pipeline híbrido Dense (BGE-M3) + Sparse (BM25) + Reranker."""
+    """Búsqueda Híbrida nativa: Dense + Sparse (Lexical) de BGE-M3 fusionados con RRF."""
     try:
-        import torch
-
         client = get_qdrant_client()
-        modelo_denso = get_embedding_model()
-        modelo_disperso = get_sparse_model()
+        modelo = get_embedding_model()
 
         if isinstance(consultas, str):
             lista_consultas = [consultas]
@@ -133,8 +105,6 @@ def buscar_fragmentos(
         subconsultas_validas = [q.strip() for q in lista_consultas if q.strip()]
         if not subconsultas_validas:
             return []
-
-        query_rerank = (consulta_referencia or subconsultas_validas[0]).strip()
 
         filtro_region = models.Filter(
             must=[
@@ -146,24 +116,29 @@ def buscar_fragmentos(
         )
 
         prefetches: List[models.Prefetch] = []
-        with torch.inference_mode():
-            for sub_query in subconsultas_validas:
-                vector_denso = modelo_denso.encode(sub_query, normalize_embeddings=True).tolist()
-                vector_disperso = list(modelo_disperso.embed([sub_query]))[0]
 
-                prefetches.append(
-                    models.Prefetch(
-                        query=vector_denso,
-                        using="dense",
-                        limit=recall_k * 2,
-                        filter=filtro_region
-                    )
+        for sub_query in subconsultas_validas:
+            salida = modelo.encode([sub_query], return_dense=True, return_sparse=True)
+            v_denso = salida["dense_vecs"][0].tolist()
+            lexical_dict = salida["lexical_weights"][0]
+
+            indices_sparse = [int(k) for k in lexical_dict.keys()]
+            values_sparse = [float(v) for v in lexical_dict.values()]
+
+            prefetches.append(
+                models.Prefetch(
+                    query=v_denso,
+                    using="dense",
+                    limit=recall_k * 2,
+                    filter=filtro_region
                 )
+            )
+            if indices_sparse:
                 prefetches.append(
                     models.Prefetch(
                         query=models.SparseVector(
-                            indices=vector_disperso.indices.tolist(),
-                            values=vector_disperso.values.tolist()
+                            indices=indices_sparse,
+                            values=values_sparse
                         ),
                         using="sparse",
                         limit=recall_k * 2,
@@ -176,7 +151,7 @@ def buscar_fragmentos(
             prefetch=prefetches,
             query=models.FusionQuery(fusion=models.Fusion.RRF),
             query_filter=filtro_region,
-            limit=recall_k * 2,
+            limit=top_k * 3,
             with_payload=True
         )
 
@@ -184,9 +159,9 @@ def buscar_fragmentos(
         if not puntos_fusionados:
             return []
 
-        candidatos_rerank = []
-        conteo_doc_pre: Dict[str, int] = {}
-        conteo_pag_pre: Dict[str, int] = {}
+        candidatos_finales = []
+        conteo_doc: Dict[str, int] = {}
+        conteo_pag: Dict[str, int] = {}
         ids_vistos = set()
 
         for p in puntos_fusionados:
@@ -198,44 +173,35 @@ def buscar_fragmentos(
             pag = str(pl.get("pagina", "N/A"))
             clave_pag = f"{doc}_{pag}"
 
-            if conteo_pag_pre.get(clave_pag, 0) >= max_por_pagina:
+            if conteo_pag.get(clave_pag, 0) >= max_por_pagina:
                 continue
-            if conteo_doc_pre.get(doc, 0) >= max_por_doc:
+            if conteo_doc.get(doc, 0) >= max_por_doc:
                 continue
 
             ids_vistos.add(p.id)
-            conteo_pag_pre[clave_pag] = conteo_pag_pre.get(clave_pag, 0) + 1
-            conteo_doc_pre[doc] = conteo_doc_pre.get(doc, 0) + 1
+            conteo_pag[clave_pag] = conteo_pag.get(clave_pag, 0) + 1
+            conteo_doc[doc] = conteo_doc.get(doc, 0) + 1
 
-            candidatos_rerank.append({
+            candidatos_finales.append({
                 "documento": doc,
                 "ruta_relativa": pl.get("ruta_relativa", ""),
                 "pagina": pl.get("pagina", "N/A"),
                 "contenido": pl.get("contenido", ""),
                 "region": pl.get("region", region),
-                "score_rrf": float(p.score)
+                "score": float(p.score)
             })
 
-            if len(candidatos_rerank) >= recall_k:
+            if len(candidatos_finales) >= top_k:
                 break
 
-        reranker = get_reranker_model()
-        textos_candidatos = [c["contenido"] for c in candidatos_rerank]
-        scores_rerank = list(reranker.rerank(query_rerank, textos_candidatos))
-
-        for candidato, score_r in zip(candidatos_rerank, scores_rerank):
-            candidato["score"] = float(score_r)
-
-        candidatos_ordenados = sorted(candidatos_rerank, key=lambda x: x["score"], reverse=True)
-        return candidatos_ordenados[:top_k]
+        return candidatos_finales
 
     except Exception as e:
-        print(f"[ERROR BÚSQUEDA QDRANT + RERANKER] {e}")
+        print(f"[ERROR BÚSQUEDA QDRANT HÍBRIDA BGE-M3] {e}")
         return []
 
 
 def eliminar_documento_por_ruta(ruta_relativa: str):
-    """Elimina todos los vectores asociados a un archivo modificado o borrado."""
     client = get_qdrant_client()
     client.delete(
         collection_name=settings.QDRANT_COLLECTION_NAME,
@@ -253,7 +219,6 @@ def eliminar_documento_por_ruta(ruta_relativa: str):
 
 
 def indexar_chunks_documento(puntos: List[models.PointStruct]):
-    """Inserta o actualiza un lote de fragmentos vectorizados en Qdrant."""
     if not puntos:
         return
     client = get_qdrant_client()
@@ -264,13 +229,10 @@ def indexar_chunks_documento(puntos: List[models.PointStruct]):
 
 
 def precargar_modelos_en_segundo_plano():
-    """Ejecuta la precarga de modelos en segundo plano sin congelar la app."""
     try:
-        print("\n[WARM-UP] Iniciando precarga silenciosa de modelos en segundo plano...")
+        print("\n[WARM-UP] Iniciando precarga silenciosa de BGE-M3 (Dense + Sparse)...")
         get_embedding_model()
-        get_sparse_model()
-        get_reranker_model()
         get_qdrant_client()
-        print("[WARM-UP] Modelos precargados exitosamente en memoria RAM. Listo para inferencia instantánea.\n")
+        print("[WARM-UP] BGE-M3 precargado exitosamente en RAM. Listo para inferencia híbrida.\n")
     except Exception as e:
-        print(f"[WARM-UP WARN] No se completó la precarga en background: {e}")
+        print(f"[WARM-UP WARN] Error en precarga: {e}")
