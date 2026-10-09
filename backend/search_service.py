@@ -9,13 +9,10 @@ from fastembed import SparseTextEmbedding
 from fastembed.rerank.cross_encoder import TextCrossEncoder
 from backend.config import settings
 
-# BGE-M3 tiene dimensión estándar estricta de 1024
 DIMENSION_BGE_M3 = 1024
 
-# Lock para sincronizar inicialización y evitar competencia concurrente
 _lock_modelos = threading.Lock()
 
-# Instancias singleton para reutilizar memoria
 _qdrant_client: Optional[QdrantClient] = None
 _embedding_model = None
 _sparse_model: Optional[SparseTextEmbedding] = None
@@ -23,7 +20,7 @@ _reranker_model: Optional[TextCrossEncoder] = None
 
 
 def get_embedding_model():
-    """Carga BAAI/bge-m3 protegido contra concurrencia y sin descargas redundantes."""
+    """Carga BAAI/bge-m3 desde la carpeta local preempaquetada."""
     global _embedding_model
     with _lock_modelos:
         if _embedding_model is None:
@@ -39,17 +36,21 @@ def get_embedding_model():
                 cpus = os.cpu_count() or 4
                 torch.set_num_threads(cpus)
 
-            print(f"[INFO EMBEDDINGS] Inicializando {settings.EMBEDDING_MODEL_NAME} en: {dispositivo.upper()}")
+            # Priorizar la ruta local empaquetada
+            ruta_local = settings.dense_model_path
+            modelo_origen = str(ruta_local) if ruta_local.exists() else settings.EMBEDDING_MODEL_NAME
+
+            print(f"[INFO EMBEDDINGS] Inicializando {modelo_origen} en: {dispositivo.upper()}")
 
             try:
                 _embedding_model = SentenceTransformer(
-                    settings.EMBEDDING_MODEL_NAME,
+                    modelo_origen,
                     device=dispositivo,
                     local_files_only=True
                 )
             except Exception:
                 _embedding_model = SentenceTransformer(
-                    settings.EMBEDDING_MODEL_NAME,
+                    modelo_origen,
                     device=dispositivo,
                     local_files_only=False
                 )
@@ -60,36 +61,42 @@ def get_embedding_model():
 
 
 def get_sparse_model() -> SparseTextEmbedding:
-    """Carga BM25 forzando lectura local para evitar [Errno 11001]."""
+    """Carga BM25 desde la carpeta de caché preempaquetada."""
     global _sparse_model
     with _lock_modelos:
         if _sparse_model is None:
+            cache_path = str(settings.fastembed_cache_dir)
             try:
                 _sparse_model = SparseTextEmbedding(
                     model_name=settings.SPARSE_MODEL_NAME,
+                    cache_dir=cache_path,
                     local_files_only=True
                 )
             except Exception:
                 _sparse_model = SparseTextEmbedding(
                     model_name=settings.SPARSE_MODEL_NAME,
+                    cache_dir=cache_path,
                     local_files_only=False
                 )
     return _sparse_model
 
 
 def get_reranker_model() -> TextCrossEncoder:
-    """Carga el Reranker forzando lectura local para evitar [Errno 11001]."""
+    """Carga el Cross-Encoder desde la carpeta de caché preempaquetada."""
     global _reranker_model
     with _lock_modelos:
         if _reranker_model is None:
+            cache_path = str(settings.fastembed_cache_dir)
             try:
                 _reranker_model = TextCrossEncoder(
                     model_name=settings.RERANKER_MODEL_NAME,
+                    cache_dir=cache_path,
                     local_files_only=True
                 )
             except Exception:
                 _reranker_model = TextCrossEncoder(
                     model_name=settings.RERANKER_MODEL_NAME,
+                    cache_dir=cache_path,
                     local_files_only=False
                 )
     return _reranker_model
@@ -135,11 +142,7 @@ def buscar_fragmentos(
         max_por_doc: int = 3,
         max_por_pagina: int = 2
 ) -> List[Dict]:
-    """
-    Pipeline bi-etápico de recuperación:
-    1. Fase Híbrida: BGE-M3 + BM25 con RRF en Qdrant (recall_k=12 para menor carga en CPU).
-    2. Fase Cross-Encoder: BGE-Reranker-Base clasifica y retorna los top_k más relevantes.
-    """
+    """Pipeline bi-etápico de recuperación híbrida + reranking."""
     try:
         import torch
 
@@ -298,7 +301,7 @@ def indexar_chunks_documento(puntos: List[models.PointStruct]):
 
 
 def precargar_modelos_en_segundo_plano():
-    """Ejecuta la importación y carga de modelos en segundo plano tras levantar el servidor."""
+    """Ejecuta la precarga de modelos en segundo plano sin bloquear el servidor."""
     try:
         print("\n[WARM-UP] Iniciando precarga silenciosa de modelos en segundo plano...")
         get_embedding_model()

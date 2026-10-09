@@ -5,10 +5,7 @@ from pathlib import Path
 import platformdirs
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-# =======================================================
-# MODO OFFLINE ESTRICTO PARA HUGGING FACE / TRANSFORMERS
-# Evita chequeos constantes de ETag/versión en internet
-# =======================================================
+# Modo offline estricto
 os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
@@ -22,33 +19,22 @@ def get_base_dir() -> Path:
 
 
 class Settings(BaseSettings):
-    # API Key de Gemini
     GEMINI_API_KEY: str
-
-    # Modelo para síntesis documental y citas normativas estrictas
     GEMINI_MODEL_SYNTHESIS: str = "gemini-2.5-flash"
-
-    # Modelo para reformulación y descomposición de subconsultas
     GEMINI_MODEL_REWRITE: str = "gemini-2.0-flash-lite"
 
-    # Alias de compatibilidad hacia atrás
     @property
     def GEMINI_MODEL(self) -> str:
         return self.GEMINI_MODEL_SYNTHESIS
 
-    # Configuración de Embeddings Multilingües, Sparse y Reranker
+    # Nombres de identificador
     EMBEDDING_MODEL_NAME: str = "BAAI/bge-m3"
     SPARSE_MODEL_NAME: str = "Qdrant/bm25"
     RERANKER_MODEL_NAME: str = "BAAI/bge-reranker-base"
 
-    # Rutas de almacenamiento local de usuario (No requieren permisos de Administrador)
     APP_NAME: str = "CopilotoNormativas"
     APP_AUTHOR: str = "ArquitecturaSistemas"
-
-    # Nombre de la colección en Qdrant
     QDRANT_COLLECTION_NAME: str = "normativas_tecnicas"
-
-    # Carpeta de vigencia que se debe filtrar obligatoriamente
     CARPETA_VIGENCIA: str = "2025-2026"
 
     model_config = SettingsConfigDict(
@@ -80,6 +66,19 @@ class Settings(BaseSettings):
     def sqlite_url(self) -> str:
         """URL de conexión para SQLAlchemy."""
         return f"sqlite:///{self.sqlite_path}"
+
+    # Rutas físicas a los modelos empaquetados
+    @property
+    def models_cache_dir(self) -> Path:
+        return get_base_dir() / "models_cache"
+
+    @property
+    def dense_model_path(self) -> Path:
+        return self.models_cache_dir / "bge-m3"
+
+    @property
+    def fastembed_cache_dir(self) -> Path:
+        return self.models_cache_dir / "fastembed_cache"
 
 
 try:
