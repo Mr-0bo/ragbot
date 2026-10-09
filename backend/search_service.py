@@ -3,6 +3,7 @@ import os
 import sys
 import threading
 from typing import List, Dict, Optional, Union
+from pathlib import Path
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
 from fastembed import SparseTextEmbedding
@@ -37,7 +38,7 @@ def get_embedding_model():
                 torch.set_num_threads(cpus)
 
             # Priorizar la ruta local empaquetada
-            ruta_local = settings.dense_model_path
+            ruta_local = Path(settings.dense_model_path)
             modelo_origen = str(ruta_local) if ruta_local.exists() else settings.EMBEDDING_MODEL_NAME
 
             print(f"[INFO EMBEDDINGS] Inicializando {modelo_origen} en: {dispositivo.upper()}")
@@ -61,42 +62,52 @@ def get_embedding_model():
 
 
 def get_sparse_model() -> SparseTextEmbedding:
-    """Carga BM25 desde la carpeta de caché preempaquetada."""
+    """Carga BM25 directamente desde la ruta local para evitar llamadas a red o bugs con tar.gz."""
     global _sparse_model
     with _lock_modelos:
         if _sparse_model is None:
-            cache_path = str(settings.fastembed_cache_dir)
+            cache_path = Path(settings.fastembed_cache_dir)
+            directorio_bm25 = cache_path / "bm25"
+
+            # Si la carpeta local existe, se pasa como ruta directa para omitir retrieve_model_gcs
+            ruta_modelo = str(directorio_bm25) if directorio_bm25.exists() else settings.SPARSE_MODEL_NAME
+
             try:
                 _sparse_model = SparseTextEmbedding(
-                    model_name=settings.SPARSE_MODEL_NAME,
-                    cache_dir=cache_path,
+                    model_name=ruta_modelo,
+                    cache_dir=str(cache_path),
                     local_files_only=True
                 )
             except Exception:
                 _sparse_model = SparseTextEmbedding(
                     model_name=settings.SPARSE_MODEL_NAME,
-                    cache_dir=cache_path,
+                    cache_dir=str(cache_path),
                     local_files_only=False
                 )
     return _sparse_model
 
 
 def get_reranker_model() -> TextCrossEncoder:
-    """Carga el Cross-Encoder desde la carpeta de caché preempaquetada."""
+    """Carga el Cross-Encoder directamente desde la ruta local para evitar llamadas a red."""
     global _reranker_model
     with _lock_modelos:
         if _reranker_model is None:
-            cache_path = str(settings.fastembed_cache_dir)
+            cache_path = Path(settings.fastembed_cache_dir)
+            directorio_reranker = cache_path / "bge-reranker-base"
+
+            # Si la carpeta local existe, se pasa como ruta directa para omitir retrieve_model_gcs
+            ruta_modelo = str(directorio_reranker) if directorio_reranker.exists() else settings.RERANKER_MODEL_NAME
+
             try:
                 _reranker_model = TextCrossEncoder(
-                    model_name=settings.RERANKER_MODEL_NAME,
-                    cache_dir=cache_path,
+                    model_name=ruta_modelo,
+                    cache_dir=str(cache_path),
                     local_files_only=True
                 )
             except Exception:
                 _reranker_model = TextCrossEncoder(
                     model_name=settings.RERANKER_MODEL_NAME,
-                    cache_dir=cache_path,
+                    cache_dir=str(cache_path),
                     local_files_only=False
                 )
     return _reranker_model
