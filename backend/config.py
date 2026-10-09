@@ -20,8 +20,8 @@ def get_base_dir() -> Path:
 
 class Settings(BaseSettings):
     GEMINI_API_KEY: str
-    GEMINI_MODEL_SYNTHESIS: str = "gemini-2.5-flash"
-    GEMINI_MODEL_REWRITE: str = "gemini-2.0-flash-lite"
+    GEMINI_MODEL_SYNTHESIS: str = "gemini-3.5-flash-lite"
+    GEMINI_MODEL_REWRITE: str = "gemini-3.1-flash-lite"
 
     @property
     def GEMINI_MODEL(self) -> str:
