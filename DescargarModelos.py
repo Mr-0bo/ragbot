@@ -1,49 +1,52 @@
-import os
-import shutil
+# descargar_definitivo.py
 from pathlib import Path
+from huggingface_hub import snapshot_download
 
-# 1. Asegurar rutas
-ROOT_DIR = Path(__file__).resolve().parent.parent
+ROOT_DIR = Path(__file__).resolve().parent
 MODELS_DIR = ROOT_DIR / "models_cache"
 FASTEMBED_DIR = MODELS_DIR / "fastembed_cache"
 
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 FASTEMBED_DIR.mkdir(parents=True, exist_ok=True)
 
-# 2. Desactivar flags offline para este script
-for var in ["HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"]:
-    os.environ.pop(var, None)
+print("1. Descargando repositorio BM25 desde Hugging Face...")
+# FastEmbed usa la caché estándar de huggingface dentro de su cache_dir
+ruta_bm25 = snapshot_download(
+    repo_id="Qdrant/bm25",
+    cache_dir=str(FASTEMBED_DIR),
+    local_dir_use_symlinks=False
+)
+print(f" -> Guardado en: {ruta_bm25}")
 
-print("=== 1/3 Descargando BGE-M3 (SentenceTransformers) ===")
-from sentence_transformers import SentenceTransformer
-dense_path = MODELS_DIR / "bge-m3"
-# Descarga y guarda el modelo completo de forma nativa
-model = SentenceTransformer("BAAI/bge-m3")
-model.save(str(dense_path))
-print("-> BGE-M3 guardado.")
+print("\n2. Descargando repositorio Reranker desde Hugging Face...")
+ruta_reranker = snapshot_download(
+    repo_id="BAAI/bge-reranker-base",
+    cache_dir=str(FASTEMBED_DIR),
+    local_dir_use_symlinks=False
+)
+print(f" -> Guardado en: {ruta_reranker}")
 
-print("\n=== 2/3 Descargando BM25 (FastEmbed) ===")
+print("\n3. Descargando BGE-M3 denso...")
+ruta_dense = MODELS_DIR / "bge-m3"
+if not (ruta_dense / "model.safetensors").exists():
+    snapshot_download(
+        repo_id="BAAI/bge-m3",
+        local_dir=str(ruta_dense),
+        local_dir_use_symlinks=False
+    )
+print(f" -> Guardado en: {ruta_dense}")
+
+print("\n--- PROBANDO INICIALIZACIÓN CON FASTEMBED ---")
 from fastembed import SparseTextEmbedding
-# FastEmbed descarga automáticamente el tar.gz correcto si local_files_only=False
-bm25 = SparseTextEmbedding(
-    model_name="Qdrant/bm25",
-    cache_dir=str(FASTEMBED_DIR),
-    local_files_only=False
-)
-# Llamada de inferencia obligatoria para que extraiga los pesos en disco
-list(bm25.embed(["warmup"]))
-print("-> BM25 guardado y extraído.")
-
-print("\n=== 3/3 Descargando Reranker (FastEmbed) ===")
 from fastembed.rerank.cross_encoder import TextCrossEncoder
-reranker = TextCrossEncoder(
-    model_name="BAAI/bge-reranker-base",
-    cache_dir=str(FASTEMBED_DIR),
-    local_files_only=False
-)
-list(reranker.rerank("query", ["doc"]))
-print("-> Reranker guardado y extraído.")
 
-print("\n===========================================")
-print("¡TODOS LOS MODELOS LISTOS EN 'models_cache'!")
-print("===========================================")
+# Probamos cargarlos pasándoles la carpeta
+bm25 = SparseTextEmbedding("Qdrant/bm25", cache_dir=str(FASTEMBED_DIR), local_files_only=True)
+res_bm25 = list(bm25.embed(["Hola mundo"]))
+print("✓ BM25 cargó y generó vector con éxito.")
+
+reranker = TextCrossEncoder("BAAI/bge-reranker-base", cache_dir=str(FASTEMBED_DIR), local_files_only=True)
+res_rerank = list(reranker.rerank("pregunta", ["documento de prueba"]))
+print("✓ Reranker cargó y evaluó con éxito.")
+
+print("\n¡TODO CONFIGURADO Y FUNCIONANDO EN LOCAL!")
