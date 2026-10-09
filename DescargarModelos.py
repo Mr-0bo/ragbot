@@ -1,10 +1,8 @@
-# scripts/descargar_modelos.py
 import os
-import sys
-import tarfile
-import urllib.request
+import shutil
 from pathlib import Path
 
+# 1. Asegurar rutas
 ROOT_DIR = Path(__file__).resolve().parent.parent
 MODELS_DIR = ROOT_DIR / "models_cache"
 FASTEMBED_DIR = MODELS_DIR / "fastembed_cache"
@@ -12,63 +10,40 @@ FASTEMBED_DIR = MODELS_DIR / "fastembed_cache"
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 FASTEMBED_DIR.mkdir(parents=True, exist_ok=True)
 
-print(f"Ruta base limpia: {MODELS_DIR}\n")
+# 2. Desactivar flags offline para este script
+for var in ["HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"]:
+    os.environ.pop(var, None)
 
-# 1. BGE-M3
+print("=== 1/3 Descargando BGE-M3 (SentenceTransformers) ===")
+from sentence_transformers import SentenceTransformer
 dense_path = MODELS_DIR / "bge-m3"
-if not (dense_path / "model.safetensors").exists():
-    print("[1/3] Descargando BAAI/bge-m3...")
-    from sentence_transformers import SentenceTransformer
-    model = SentenceTransformer("BAAI/bge-m3")
-    model.save(str(dense_path))
-    print(" -> BGE-M3 completado.")
-else:
-    print("[1/3] BGE-M3 ya existe en disco.")
+# Descarga y guarda el modelo completo de forma nativa
+model = SentenceTransformer("BAAI/bge-m3")
+model.save(str(dense_path))
+print("-> BGE-M3 guardado.")
 
-# Función auxiliar para descargar y descomprimir tar.gz de FastEmbed manualmente
-def instalar_modelo_fastembed(nombre_carpeta: str, url_tar: str):
-    destino = FASTEMBED_DIR / nombre_carpeta
-    if destino.exists() and any(destino.iterdir()):
-        print(f" -> {nombre_carpeta} ya existe.")
-        return
-
-    destino.mkdir(parents=True, exist_ok=True)
-    archivo_tar = FASTEMBED_DIR / f"{nombre_carpeta}.tar.gz"
-
-    print(f"Descargando {nombre_carpeta} desde {url_tar}...")
-    urllib.request.urlretrieve(url_tar, archivo_tar)
-
-    print(f"Extrayendo {archivo_tar.name}...")
-    with tarfile.open(archivo_tar, "r:gz") as tar:
-        tar.extractall(path=destino)
-
-    if archivo_tar.exists():
-        archivo_tar.unlink()
-    print(f" -> {nombre_carpeta} instalado correctamente.")
-
-# 2. Descarga explícita de BM25
-print("\n[2/3] Instalando FastEmbed BM25...")
-url_bm25 = "https://storage.googleapis.com/qdrant-fastembed/fast-bm25.tar.gz"
-instalar_modelo_fastembed("bm25", url_bm25)
-
-# 3. Descarga explícita de Reranker (bge-reranker-base)
-print("\n[3/3] Instalando FastEmbed Reranker...")
-url_reranker = "https://storage.googleapis.com/qdrant-fastembed/bge-reranker-base.tar.gz"
-instalar_modelo_fastembed("bge-reranker-base", url_reranker)
-
-# 4. Verificación e inferencia offline
-print("\nVerificando carga offline de FastEmbed...")
+print("\n=== 2/3 Descargando BM25 (FastEmbed) ===")
 from fastembed import SparseTextEmbedding
+# FastEmbed descarga automáticamente el tar.gz correcto si local_files_only=False
+bm25 = SparseTextEmbedding(
+    model_name="Qdrant/bm25",
+    cache_dir=str(FASTEMBED_DIR),
+    local_files_only=False
+)
+# Llamada de inferencia obligatoria para que extraiga los pesos en disco
+list(bm25.embed(["warmup"]))
+print("-> BM25 guardado y extraído.")
+
+print("\n=== 3/3 Descargando Reranker (FastEmbed) ===")
 from fastembed.rerank.cross_encoder import TextCrossEncoder
-
-bm25 = SparseTextEmbedding(model_name="Qdrant/bm25", cache_dir=str(FASTEMBED_DIR), local_files_only=True)
-list(bm25.embed(["prueba exitosa"]))
-print("✓ BM25 operativo 100% offline.")
-
-reranker = TextCrossEncoder(model_name="BAAI/bge-reranker-base", cache_dir=str(FASTEMBED_DIR), local_files_only=True)
+reranker = TextCrossEncoder(
+    model_name="BAAI/bge-reranker-base",
+    cache_dir=str(FASTEMBED_DIR),
+    local_files_only=False
+)
 list(reranker.rerank("query", ["doc"]))
-print("✓ Reranker operativo 100% offline.")
+print("-> Reranker guardado y extraído.")
 
-print("\n" + "=" * 50)
-print("¡TODOS LOS MODELOS INSTALADOS Y LISTOS!")
-print("=" * 50)
+print("\n===========================================")
+print("¡TODOS LOS MODELOS LISTOS EN 'models_cache'!")
+print("===========================================")
