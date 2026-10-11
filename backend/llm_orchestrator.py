@@ -9,7 +9,6 @@ from google.genai import types
 from backend.config import settings
 from backend.search_service import get_embedding_model
 
-# Singleton del cliente Gemini
 _client: Optional[genai.Client] = None
 
 # Configuración de referencias para clasificación conversacional local
@@ -32,7 +31,6 @@ _VECTORES_CONV_REF = None
 
 
 def get_gemini_client() -> genai.Client:
-    """Inicializa o retorna la instancia del cliente oficial de Gemini."""
     global _client
     if _client is None:
         if not settings or not settings.GEMINI_API_KEY:
@@ -42,13 +40,11 @@ def get_gemini_client() -> genai.Client:
 
 
 def _get_vectores_conversacionales():
-    """Carga y almacena en caché los embeddings normalizados de las frases de cortesía."""
     global _VECTORES_CONV_REF
     if _VECTORES_CONV_REF is None:
         modelo = get_embedding_model()
         vectores = []
         for frase in _FRASES_CONVERSACIONALES_REF:
-            # Compatibilidad nativa con SentenceTransformer (.encode)
             vec = np.array(modelo.encode(frase), dtype=np.float32)
             norm = np.linalg.norm(vec)
             if norm > 0:
@@ -59,16 +55,16 @@ def _get_vectores_conversacionales():
 
 
 def clasificar_intencion(mensaje: str) -> str:
-    """
-    Clasifica en local si la intención es CONVERSACIONAL o TECNICA,
-    priorizando expresiones regulares para resolver en <1 ms.
-    """
+    """Clasifica la intención limpiando primero letras repetidas en saludos comunes."""
     msg_limpio = mensaje.strip().lower()
     if not msg_limpio:
         return "CONVERSACIONAL"
 
-    # 1. Extracción de residuo eliminando cortesías y puntuación
+    # 1. Limpieza de puntuación y letras estiradas (ej. holaaaaa -> hola)
     texto_sin_puntuacion = re.sub(r'[^\w\s]', '', msg_limpio)
+    texto_sin_puntuacion = re.sub(r'h+o+l+a+', 'hola', texto_sin_puntuacion)
+    texto_sin_puntuacion = re.sub(r'b+u+e+n+a+s+', 'buenas', texto_sin_puntuacion)
+
     residuo = PATRON_CORTESIAS.sub('', texto_sin_puntuacion).strip()
     palabras_residuo = residuo.split()
 
@@ -78,7 +74,7 @@ def clasificar_intencion(mensaje: str) -> str:
     if len(palabras_residuo) >= 4:
         return "TECNICA"
 
-    # 2. Evaluación semántica para frases cortas residuales (1 a 3 palabras)
+    # 2. Evaluación semántica
     try:
         modelo = get_embedding_model()
         vec_raw = np.array(modelo.encode(msg_limpio), dtype=np.float32)
@@ -98,9 +94,6 @@ def clasificar_intencion(mensaje: str) -> str:
 
 
 async def reformular_pregunta_con_historial_async(historial_mensajes: List[Dict], pregunta_actual: str) -> List[str]:
-    """
-    Utiliza Gemini Flash Lite de forma asíncrona para resolver correferencias y descomponer consultas.
-    """
     client = get_gemini_client()
 
     historial_contexto = ""
@@ -124,7 +117,6 @@ Reglas:
 
     try:
         modelo_rewrite = getattr(settings, "GEMINI_MODEL_REWRITE", "gemini-3.1-flash-lite")
-        # Llamada asíncrona no bloqueante
         respuesta = await client.aio.models.generate_content(
             model=modelo_rewrite,
             contents=prompt,
@@ -142,40 +134,37 @@ Reglas:
         return [pregunta_actual]
 
 
-async def generar_respuesta_chat_async(system_prompt: str, user_prompt: str, historial: Optional[List[Dict]] = None) -> str:
-    """
-    Invoca Gemini de forma asíncrona para redactar la respuesta técnica sin bloquear Uvicorn.
-    """
+async def generar_respuesta_chat_async(system_prompt: str, user_prompt: str,
+                                       historial: Optional[List[Dict]] = None) -> str:
+    """Implementa AsyncChat de Gemini para resolver la advertencia de Google SDK."""
     try:
         client = get_gemini_client()
-        contents = []
+        history_contents = []
 
         if historial:
             for h in historial:
                 rol_gemini = "user" if h["rol"] == "user" else "model"
-                contents.append(
+                history_contents.append(
                     types.Content(
                         role=rol_gemini,
                         parts=[types.Part.from_text(text=h["contenido"])]
                     )
                 )
 
-        contents.append(
-            types.Content(
-                role="user",
-                parts=[types.Part.from_text(text=user_prompt)]
-            )
-        )
-
         modelo_synthesis = getattr(settings, "GEMINI_MODEL_SYNTHESIS", "gemini-3.5-flash-lite")
-        respuesta = await client.aio.models.generate_content(
+
+        # Inicializamos la sesión de chat con el historial
+        chat = client.aio.chats.create(
             model=modelo_synthesis,
-            contents=contents,
             config=types.GenerateContentConfig(
                 system_instruction=system_prompt,
                 temperature=0.1
-            )
+            ),
+            history=history_contents
         )
+
+        # Enviamos solo el prompt actual
+        respuesta = await chat.send_message(user_prompt)
         return respuesta.text if respuesta.text else "No se obtuvo respuesta del modelo."
     except Exception as e:
         print(f"[ERROR GEMINI CHAT ASYNC] {e}")

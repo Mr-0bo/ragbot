@@ -26,7 +26,6 @@ class ChatResponse(BaseModel):
 
 @router.post("/chat", response_model=ChatResponse)
 async def endpoint_chat(payload: ChatRequest, db: Session = Depends(get_db)):
-    """Manejo asíncrono de consultas para evitar bloqueos del servidor."""
     pregunta_limpia = payload.pregunta.strip()
     if not pregunta_limpia:
         raise HTTPException(status_code=400, detail="La pregunta no puede estar vacía.")

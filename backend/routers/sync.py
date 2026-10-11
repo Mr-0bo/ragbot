@@ -139,7 +139,7 @@ def procesar_e_indexar_pdf(archivo: Path, region: str, db: Session) -> Dict[str,
         modelo = get_embedding_model()
         eliminar_documento_por_ruta(ruta_abs)
 
-        lote_size = 4  # Cambiar a 16 o 32 en Mac M4
+        lote_size = 64  # Cambiar a 16 o 32 en Mac M4
         puntos_qdrant = []
 
         print(f"\n[DEBUGGER INFERENCIA] 🧠 Vectorizando {len(textos_chunk)} chunks con BGE-M3 (Dense Only)...")

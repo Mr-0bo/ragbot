@@ -189,7 +189,7 @@ def procesar_e_indexar_archivo(
     if not textos_chunk:
         return 0
 
-    lote_size = 4  # Cambiar a 16 o 32 en Mac M4
+    lote_size = 64 # Cambiar a 16 o 32 en Mac M4
 
     for b in range(0, len(textos_chunk), lote_size):
         sub_lote = textos_chunk[b: b + lote_size]
