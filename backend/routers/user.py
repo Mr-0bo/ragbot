@@ -120,65 +120,43 @@ class MessageResponse(BaseModel):
 
 
 # ==========================================
-# SELECTORES ROBUSTOS AISLADOS CON TKINTER
+# SELECTORES ROBUSTOS AISLADOS CON TKINTER (VÍA CLI)
 # ==========================================
-def _ejecutar_tkinter_aislado(codigo_script: str) -> str:
-    """
-    Ejecuta un script mínimo de Tkinter en un subproceso de Python limpio.
-    - Cumple la regla de macOS: corre en el main thread de su propio proceso.
-    - Cumple la regla de Windows: no depende de PowerShell ni arrastra todo el backend.
-    """
+def _ejecutar_tkinter_aislado(flag: str) -> str:
+    """Ejecuta el propio binario en modo 'solo ventana' para velocidad extrema sin bucles."""
     try:
         flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+
+        # Si está compilado, usa el .exe/.app. Si es desarrollo, usa python main.py
+        if getattr(sys, 'frozen', False):
+            comando = [sys.executable, flag]
+        else:
+            from backend.config import get_base_dir
+            script_path = str(get_base_dir() / "main.py")
+            comando = [sys.executable, script_path, flag]
+
         resultado = subprocess.run(
-            [sys.executable, "-c", codigo_script],
-            capture_output=True,
-            text=True,
-            creationflags=flags
+            comando, capture_output=True, text=True, creationflags=flags
         )
-        return resultado.stdout.strip()
+
+        # Tomamos solo la última línea por si alguna librería imprimió basura o banners antes
+        lineas = [l for l in resultado.stdout.split('\n') if l.strip()]
+        return lineas[-1].strip() if lineas else ""
     except Exception as e:
-        print(f"[WARN DIALOGO TKINTER] Error al invocar selector: {e}")
+        print(f"[WARN DIALOGO TKINTER] Error: {e}")
         return ""
 
 
 @router.post("/browse-directory")
 def examinar_directorio_nativo():
     """Abre el explorador de carpetas usando Tkinter aislado."""
-    codigo = (
-        "import tkinter as tk; "
-        "from tkinter import filedialog; "
-        "root = tk.Tk(); "
-        "root.withdraw(); "
-        "root.attributes('-topmost', True); "
-        "root.after(50, lambda: root.focus_force()); "
-        "p = filedialog.askdirectory(title='Selecciona la carpeta de normativas'); "
-        "root.destroy(); "
-        "print(p if p else '')"
-    )
-    ruta_elegida = _ejecutar_tkinter_aislado(codigo)
-    return {"ruta": ruta_elegida}
+    return {"ruta": _ejecutar_tkinter_aislado("--tk-dir")}
 
 
 @router.post("/browse-file")
 def examinar_archivo_nativo():
     """Abre el explorador de archivos nativo (.json) usando Tkinter aislado."""
-    codigo = (
-        "import tkinter as tk; "
-        "from tkinter import filedialog; "
-        "root = tk.Tk(); "
-        "root.withdraw(); "
-        "root.attributes('-topmost', True); "
-        "root.after(50, lambda: root.focus_force()); "
-        "p = filedialog.askopenfilename("
-        "   title='Selecciona el chat a importar', "
-        "   filetypes=[('Archivos JSON', '*.json'), ('Todos los archivos', '*.*')]"
-        "); "
-        "root.destroy(); "
-        "print(p if p else '')"
-    )
-    ruta_elegida = _ejecutar_tkinter_aislado(codigo)
-    return {"ruta": ruta_elegida}
+    return {"ruta": _ejecutar_tkinter_aislado("--tk-file")}
 
 
 @router.post("/validate-directory")

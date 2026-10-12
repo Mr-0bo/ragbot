@@ -9,7 +9,7 @@ if (!userId) {
 let sesionActivaId = null;
 let pronombreSeleccionado = "neutro";
 let regionSeleccionada = "mexico";
-let nombreAgenteGlobal = "Copiloto Técnico";
+let nombreAgenteGlobal = "Agente de Búsqueda";
 let datosUsuarioCache = null;
 
 // Control de Sesión a exportar / contextual
@@ -120,8 +120,8 @@ function avanzarPaso2() {
   document.getElementById("wizard-step-1").style.display = "none";
   document.getElementById("wizard-step-2").style.display = "block";
   document.getElementById("wizard-badge-icon").innerText = "📁";
-  document.getElementById("modal-title").innerText = "Repositorio Normativo";
-  document.getElementById("modal-desc").innerText = "Selecciona tu región y vincula tus carpetas sincronizadas de OneDrive.";
+  document.getElementById("modal-title").innerText = "Repositorio";
+  document.getElementById("modal-desc").innerText = "Selecciona tu región y carpetas para indexar.";
 
   verificarHabilitacionBotonInicio();
 }
@@ -154,7 +154,7 @@ function actualizarBadgeRegionSidebar(region) {
   const badge = document.getElementById("sidebar-region-badge");
   if (badge) {
     badge.innerText = region === "mexico" ? "MEX" : "CAM";
-    badge.title = region === "mexico" ? "Normativas México" : "Normativas Centroamérica";
+    badge.title = region === "mexico" ? "México" : "Centroamérica";
   }
 }
 
@@ -209,7 +209,7 @@ async function validarRutaInput(inputEl) {
     if (res.ok) {
       const data = await res.json();
       inputEl.value = data.ruta_normalizada;
-      marcarCampoEstado(inputEl, badgeEl, true, "✓ OneDrive Válido");
+      marcarCampoEstado(inputEl, badgeEl, true, "✓ Carpeta Válida");
       if (esObligatorio) estadoRutasValidas.obligatoria = true;
       if (idInput.includes("opc1")) estadoRutasValidas.opc1 = true;
       if (idInput.includes("opc2")) estadoRutasValidas.opc2 = true;
@@ -259,7 +259,7 @@ function verificarHabilitacionBotonInicio() {
       if (tooltipWrapper) tooltipWrapper.removeAttribute("data-tooltip");
     } else {
       btn.classList.add("btn-disabled");
-      if (tooltipWrapper) tooltipWrapper.setAttribute("data-tooltip", "Debes validar la carpeta obligatoria de OneDrive para comenzar");
+      if (tooltipWrapper) tooltipWrapper.setAttribute("data-tooltip", "Debes validar la carpeta obligatoria para comenzar");
     }
   }
 }
@@ -332,7 +332,7 @@ async function procederPostDisclaimer() {
       onboarding.style.display = "flex";
     }
   } else {
-    nombreAgenteGlobal = datosUsuarioCache.nombre_agente || "Copiloto Técnico";
+    nombreAgenteGlobal = datosUsuarioCache.nombre_agente || "Agente de Búsqueda";
     regionSeleccionada = datosUsuarioCache.region || "mexico";
     actualizarTopbar(nombreAgenteGlobal);
     actualizarSidebarPerfil(datosUsuarioCache.nombre, datosUsuarioCache.pronombre);
@@ -373,7 +373,7 @@ async function iniciarGuardadoEIndexacion() {
   if (btn.classList.contains("btn-disabled")) return;
 
   const nombre = document.getElementById("user-name-input").value.trim();
-  const nombreAgente = document.getElementById("agent-name-input").value.trim() || "Copiloto Técnico";
+  const nombreAgente = document.getElementById("agent-name-input").value.trim() || "Agente de Búsqueda";
   const mandatory = document.getElementById("folder-mandatory-input").value.trim();
   const opc1 = document.getElementById("folder-opc1-input")?.value.trim() || null;
   const opc2 = document.getElementById("folder-opc2-input")?.value.trim() || null;
@@ -503,7 +503,7 @@ async function comprobarSincronizacionFondo() {
       const banner = document.getElementById("sync-notification-banner");
       const desc = document.getElementById("sync-banner-desc");
       if (desc) {
-        desc.innerText = `Se detectaron ${data.total_pendientes} cambios (${data.nuevos} nuevos, ${data.modificados} modificados, ${data.eliminados} eliminados) en tus carpetas normativas.`;
+        desc.innerText = `Se detectaron ${data.total_pendientes} cambios (${data.nuevos} nuevos, ${data.modificados} modificados, ${data.eliminados} eliminados) en tus carpetas.`;
       }
       if (banner) banner.style.display = "flex";
     }
@@ -909,7 +909,7 @@ async function ejecutarExportacion(formato) {
     const mensajes = await res.json();
 
     const nombreUsuario = (datosUsuarioCache && datosUsuarioCache.nombre) || "Usuario";
-    const nombreAgente = nombreAgenteGlobal || "Copiloto Técnico";
+    const nombreAgente = nombreAgenteGlobal || "Agente de Búsqueda";
 
     if (formato === "json") {
       exportarComoJSON(mensajes, nombreUsuario, nombreAgente);
@@ -975,7 +975,7 @@ function exportarComoHTML(mensajes, nombreUsuario, nombreAgente) {
 
     if (m.fuentes && m.fuentes.length > 0) {
       const tags = m.fuentes.map(f => `<span class="source-tag">${f}</span>`).join("");
-      fuentesHtml = `<div class="sources-box"><strong>Fuentes normativas:</strong> ${tags}</div>`;
+      fuentesHtml = `<div class="sources-box"><strong>Fuente(s):</strong> ${tags}</div>`;
     }
 
     const contenidoHtml = marked.parse(m.contenido);
@@ -1114,7 +1114,7 @@ async function renderizarBurbuja(texto, rol, fuentes = []) {
   if (fuentes && fuentes.length > 0) {
     const fuentesDiv = document.createElement("div");
     fuentesDiv.className = "sources-container";
-    fuentesDiv.innerHTML = "<strong>Fuentes normativas:</strong> ";
+    fuentesDiv.innerHTML = "<strong>Fuente(s):</strong> ";
     fuentes.forEach(f => {
       const tag = document.createElement("span");
       tag.className = "source-tag";
@@ -1153,7 +1153,7 @@ async function enviarMensaje() {
     await cargarSesiones();
   } catch (err) {
     removerIndicadorPensando();
-    renderizarBurbuja("Ocurrió un inconveniente al consultar las normativas locales. Inténtalo de nuevo.", "assistant", []);
+    renderizarBurbuja("Ocurrió un inconveniente al consultar los archivos locales. Inténtalo de nuevo.", "assistant", []);
   }
 }
 
@@ -1188,7 +1188,7 @@ function seleccionarPronombrePerfil(valor, btn) {
 
 async function guardarAjustesPerfil() {
   const nombre = document.getElementById("profile-name-input").value.trim();
-  const agente = document.getElementById("profile-agent-input").value.trim() || "Copiloto Técnico";
+  const agente = document.getElementById("profile-agent-input").value.trim() || "Agente de Búsqueda";
 
   if (!nombre) {
     await mostrarDialogo({

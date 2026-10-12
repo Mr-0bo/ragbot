@@ -1,4 +1,59 @@
+import sys
+
+# =========================================================
+# INTERCEPTOR DE DIÁLOGOS (El que SÍ funcionaba)
+# =========================================================
+if "--tk-dir" in sys.argv:
+    import tkinter as tk
+    from tkinter import filedialog
+
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes('-topmost', True)
+    p = filedialog.askdirectory(title='Selecciona la carpeta de normativas')
+    print(p if p else '')
+    sys.exit(0)
+
+if "--tk-file" in sys.argv:
+    import tkinter as tk
+    from tkinter import filedialog
+
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes('-topmost', True)
+    p = filedialog.askopenfilename(title='Selecciona el chat a importar',
+                                   filetypes=[('Archivos JSON', '*.json'), ('Todos los archivos', '*.*')])
+    print(p if p else '')
+    sys.exit(0)
+
+import inspect
+
+# Parche estricto para evitar el crasheo de transformers/FlagEmbedding
+_original_getsourcelines = inspect.getsourcelines
+
+
+def _patched_getsourcelines(obj):
+    try:
+        return _original_getsourcelines(obj)
+    except OSError:
+        return (["def dummy(): pass\n"], 0)
+
+
+_original_getsource = inspect.getsource
+
+
+def _patched_getsource(obj):
+    try:
+        return _original_getsource(obj)
+    except OSError:
+        return "def dummy(): pass\n"
+
+
+inspect.getsourcelines = _patched_getsourcelines
+inspect.getsource = _patched_getsource
+
 import threading
+import multiprocessing
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
@@ -11,8 +66,6 @@ from boot import iniciar_sistema
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 1. El servidor arranca y el puerto 8000 abre al instante (< 1 seg)
-    # 2. Se lanza el calentamiento de modelos en segundo plano sin congelar la app
     from backend.search_service import precargar_modelos_en_segundo_plano
     hilo_warmup = threading.Thread(
         target=precargar_modelos_en_segundo_plano,
@@ -20,9 +73,7 @@ async def lifespan(app: FastAPI):
         name="WarmupModelosThread"
     )
     hilo_warmup.start()
-
     yield
-    # Código opcional de cierre al apagar la app
 
 
 app = FastAPI(
@@ -32,7 +83,6 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# Resolución de rutas compatible con desarrollo y binarios congelados (PyInstaller)
 BASE_DIR = get_base_dir()
 FRONTEND_DIR = BASE_DIR / "frontend"
 
@@ -46,12 +96,12 @@ def home():
     return FileResponse(str(index_path))
 
 
-# Registro de routers modulares
 app.include_router(user.router)
 app.include_router(chat.router)
 app.include_router(sync.router)
 
-
 if __name__ == "__main__":
-    # Inicia con la animación de boot, apertura de navegador y servidor
-    iniciar_sistema(app_import_str="main:app", host="127.0.0.1", port=8000)
+    # ESTO EVITA LA BOMBA DE CLONACIÓN
+    multiprocessing.freeze_support()
+
+    iniciar_sistema(app_import_str=app, host="127.0.0.1", port=8000)
