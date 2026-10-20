@@ -4,7 +4,7 @@ torch
 # 🚀 FRAMEWORK WEB Y SERVIDOR
 # ==========================================
 fastapi
-uvicorn
+uvicorn[standard]
 python-multipart
 pydantic
 pydantic-settings
@@ -13,6 +13,7 @@ pydantic-settings
 # 🛡️ SEGURIDAD Y AUTENTICACIÓN (MULTI-USUARIO)
 # ==========================================
 passlib[bcrypt]
+bcrypt==4.0.1
 python-jose[cryptography]
 
 # ==========================================
@@ -35,9 +36,10 @@ FlagEmbedding
 # 📄 PROCESAMIENTO DE DOCUMENTOS (PDF Y OCR)
 # ==========================================
 pymupdf
-paddleocr
-paddlepaddle
 pillow
+# paddleocr y paddlepaddle solo si vas a requerir OCR en imágenes escaneadas
+# paddleocr
+# paddlepaddle
 
 # ==========================================
 # 🛠️ UTILIDADES DEL SISTEMA
