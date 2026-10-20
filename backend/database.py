@@ -4,7 +4,7 @@ from sqlalchemy import create_engine, Column, String, Text, DateTime, ForeignKey
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 from backend.config import settings
 
-# Conexión usando la ruta segura de AppData / Application Support
+# Conexión usando la ruta segura
 engine = create_engine(
     settings.sqlite_url if settings else "sqlite:///./normativas_chat.db",
     connect_args={"check_same_thread": False}
@@ -49,11 +49,17 @@ class DocumentoNormativo(Base):
 
 
 # ==========================================
-# MODELOS DE CHAT Y USUARIO
+# MODELOS DE CHAT Y USUARIO (MULTI-USUARIO)
 # ==========================================
 class Usuario(Base):
     __tablename__ = "usuarios"
     id = Column(String, primary_key=True, index=True)
+
+    # NUEVOS CAMPOS PARA AUTENTICACIÓN
+    username = Column(String, unique=True, index=True, nullable=False)
+    password_hash = Column(String, nullable=False)
+
+    # Preferencias y personalización
     nombre = Column(String, nullable=True)
     pronombre = Column(String, nullable=True)
     nombre_agente = Column(String, default="Asistente Técnico")

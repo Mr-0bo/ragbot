@@ -1,17 +1,11 @@
 # backend/config.py
 import os
-import sys
 from pathlib import Path
-import platformdirs
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-
 def get_base_dir() -> Path:
-    """Retorna la ruta base de la aplicación tanto en desarrollo como empaquetada."""
-    if hasattr(sys, "_MEIPASS"):
-        return Path(sys._MEIPASS)
+    """Retorna la ruta base del proyecto (raíz del servidor)."""
     return Path(__file__).resolve().parent.parent
-
 
 class Settings(BaseSettings):
     GEMINI_API_KEY: str
@@ -22,13 +16,20 @@ class Settings(BaseSettings):
     def GEMINI_MODEL(self) -> str:
         return self.GEMINI_MODEL_SYNTHESIS
 
-    # Modelo unificado BGE-M3 (Dense + Sparse nativo)
+    # Modelos de Inferencia Local
     EMBEDDING_MODEL_NAME: str = "BAAI/bge-m3"
+    RERANKER_MODEL_NAME: str = "BAAI/bge-reranker-v2-m3"
 
-    APP_NAME: str = "CopilotoNormativas"
-    APP_AUTHOR: str = "ArquitecturaSistemas"
-    QDRANT_COLLECTION_NAME: str = "normativas_tecnicas"
+    # Parámetros de Recuperación y Fusión
+    TOP_K_PREFETCH: int = 20
+    TOP_K_RERANK: int = 6
+
+    APP_NAME: str = "CopilotoNormativasServer"
+    QDRANT_COLLECTION_NAME: str = "normativas_tecnicas_hibridas"
     CARPETA_VIGENCIA: str = "2025-2026"
+
+    # Ruta configurable por .env para el repositorio centralizado
+    DIRECTORIO_DOCUMENTOS: str = str(get_base_dir() / "server_data" / "documentos_normativos")
 
     model_config = SettingsConfigDict(
         env_file=get_base_dir() / ".env",
@@ -38,22 +39,22 @@ class Settings(BaseSettings):
 
     @property
     def data_dir(self) -> Path:
-        """Ruta en AppData (Windows) o Application Support (macOS)."""
-        path = Path(platformdirs.user_data_dir(self.APP_NAME, self.APP_AUTHOR))
+        """Ruta local en el servidor donde persistirán bases de datos."""
+        path = get_base_dir() / "server_data"
         path.mkdir(parents=True, exist_ok=True)
         return path
 
     @property
     def qdrant_path(self) -> Path:
-        """Ruta local donde Qdrant persistirá los vectores en disco."""
+        """Ruta local donde Qdrant persistirá colecciones e índices en disco."""
         path = self.data_dir / "qdrant_db"
         path.mkdir(parents=True, exist_ok=True)
         return path
 
     @property
     def sqlite_path(self) -> Path:
-        """Ruta del archivo SQLite para tracking de hashes y metadatos."""
-        return self.data_dir / "normativas_metadata.db"
+        """Ruta del archivo SQLite para historiales, usuarios y metadatos."""
+        return self.data_dir / "normativas_server.db"
 
     @property
     def sqlite_url(self) -> str:
@@ -62,11 +63,18 @@ class Settings(BaseSettings):
 
     @property
     def models_cache_dir(self) -> Path:
-        return get_base_dir() / "models_cache"
+        """Directorio base para modelos cacheados."""
+        path = get_base_dir() / "models_cache"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
 
     @property
     def dense_model_path(self) -> Path:
         return self.models_cache_dir / "bge-m3"
+
+    @property
+    def reranker_model_path(self) -> Path:
+        return self.models_cache_dir / "bge-reranker-v2-m3"
 
 
 try:

@@ -7,12 +7,14 @@ import sys
 import time
 from pathlib import Path
 from typing import List, Dict, Any
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from qdrant_client.http import models
 
 from backend.database import get_db, SessionLocal, ConfiguracionApp, DocumentoNormativo
+from backend.auth import obtener_usuario_actual
+from backend.config import settings
 
 router = APIRouter(prefix="/api/sync", tags=["Sincronización"])
 
@@ -22,7 +24,7 @@ def recopilar_archivos_pdf(carpetas: List[str]) -> List[Path]:
     for c in carpetas:
         if not c:
             continue
-        p = Path(c).expanduser().resolve()
+        p = Path(c).resolve()
         if p.exists() and p.is_dir():
             for archivo in p.rglob("*.pdf"):
                 if not archivo.name.startswith("._") and archivo.is_file():
@@ -38,17 +40,29 @@ def calcular_hash_archivo(ruta: Path) -> str:
     return hasher.hexdigest()
 
 
+def obtener_directorios_activos(config: ConfiguracionApp) -> List[str]:
+    """Retorna los directorios de la BD con fallback a la ruta de settings.DIRECTORIO_DOCUMENTOS."""
+    dir_principal = (config.directorio_obligatorio if config and config.directorio_obligatorio else None) or (settings.DIRECTORIO_DOCUMENTOS if settings else None)
+    directorios = [dir_principal]
+    if config:
+        if config.directorio_opcional_1:
+            directorios.append(config.directorio_opcional_1)
+        if config.directorio_opcional_2:
+            directorios.append(config.directorio_opcional_2)
+    return [d for d in directorios if d]
+
+
 @router.get("/check")
-def verificar_cambios_pendientes(db: Session = Depends(get_db)):
+def verificar_cambios_pendientes(
+    db: Session = Depends(get_db),
+    usuario_actual = Depends(obtener_usuario_actual)
+):
     config = db.query(ConfiguracionApp).first()
-    if not config or not config.directorio_obligatorio:
+    directorios = obtener_directorios_activos(config)
+
+    if not directorios:
         return {"requiere_sincronizacion": False, "total_pendientes": 0}
 
-    directorios = [
-        config.directorio_obligatorio,
-        config.directorio_opcional_1,
-        config.directorio_opcional_2
-    ]
     archivos_disco = recopilar_archivos_pdf(directorios)
     registrados = {doc.ruta_absoluta: doc for doc in db.query(DocumentoNormativo).all()}
 
@@ -83,7 +97,8 @@ def procesar_e_indexar_pdf(archivo: Path, region: str, db: Session) -> Dict[str,
     from backend.search_service import (
         get_embedding_model,
         indexar_chunks_documento,
-        eliminar_documento_por_ruta
+        eliminar_documento_por_ruta,
+        formatear_vector_disperso
     )
     from ingestion.document_parser import extraer_markdown_de_pdf
     from ingestion.ingest_docs import limpiar_texto, dividir_en_chunks
@@ -139,10 +154,10 @@ def procesar_e_indexar_pdf(archivo: Path, region: str, db: Session) -> Dict[str,
         modelo = get_embedding_model()
         eliminar_documento_por_ruta(ruta_abs)
 
-        lote_size = 64  # Cambiar a 16 o 32 en Mac M4
+        lote_size = 12
         puntos_qdrant = []
 
-        print(f"\n[DEBUGGER INFERENCIA] 🧠 Vectorizando {len(textos_chunk)} chunks con BGE-M3 (Dense Only)...")
+        print(f"\n[DEBUGGER INFERENCIA] 🧠 Vectorizando {len(textos_chunk)} chunks con BGE-M3 (Dense + Sparse)...")
 
         for b in range(0, len(textos_chunk), lote_size):
             sub_lote = textos_chunk[b: b + lote_size]
@@ -150,32 +165,23 @@ def procesar_e_indexar_pdf(archivo: Path, region: str, db: Session) -> Dict[str,
             t0_v = time.perf_counter()
             salida = modelo.encode(
                 sub_lote,
-                batch_size=lote_size,
+                batch_size=len(sub_lote),
                 max_length=512,
                 return_dense=True,
-                return_sparse=False  # --- MODO DISPERSO COMENTADO ---
+                return_sparse=True
             )
             t_vectorizacion += (time.perf_counter() - t0_v)
 
             v_densos = salida["dense_vecs"]
-            # --- MODO DISPERSO COMENTADO ---
-            # v_lexical = salida["lexical_weights"]
+            v_dispersos = salida["lexical_weights"]
 
             for sub_i, meta_idx in enumerate(range(b, b + len(sub_lote))):
                 meta = metadatos_chunk[meta_idx]
                 point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{ruta_abs}_{meta['pagina']}_{meta['sub_idx']}"))
 
-                # --- MODO DISPERSO COMENTADO ---
-                # lexical_dict = v_lexical[sub_i]
-                # indices = [int(k) for k in lexical_dict.keys()]
-                # values = [float(v) for v in lexical_dict.values()]
-                # vector_hibrido = {
-                #     "dense": v_densos[sub_i].tolist(),
-                #     "sparse": models.SparseVector(indices=indices, values=values)
-                # }
-
                 vector_payload = {
-                    "dense": v_densos[sub_i].tolist()
+                    "dense": v_densos[sub_i].tolist(),
+                    "sparse": formatear_vector_disperso(v_dispersos[sub_i])
                 }
 
                 puntos_qdrant.append(
@@ -224,7 +230,7 @@ def procesar_e_indexar_pdf(archivo: Path, region: str, db: Session) -> Dict[str,
 
     duracion_total = time.perf_counter() - t_inicio_total
 
-    print(f"⏱️ TIEMPO TOTAL: {duracion_total:.2f} s (Inferencia Densa: {t_vectorizacion:.2f} s)")
+    print(f"⏱️ TIEMPO TOTAL: {duracion_total:.2f} s (Inferencia Híbrida: {t_vectorizacion:.2f} s)")
 
     return {
         "omitido": False,
@@ -243,20 +249,17 @@ def generador_indexacion_sse():
     db = SessionLocal()
     try:
         config = db.query(ConfiguracionApp).first()
-        if not config or not config.directorio_obligatorio:
-            yield f"data: {json.dumps({'tipo': 'error', 'mensaje': 'No hay directorios configurados.'})}\n\n"
+        directorios = obtener_directorios_activos(config)
+
+        if not directorios:
+            yield f"data: {json.dumps({'tipo': 'error', 'mensaje': 'No hay directorios configurados ni en BD ni en .env.'})}\n\n"
             return
 
-        directorios = [
-            config.directorio_obligatorio,
-            config.directorio_opcional_1,
-            config.directorio_opcional_2
-        ]
         archivos = recopilar_archivos_pdf(directorios)
         total = len(archivos)
 
         if total == 0:
-            yield f"data: {json.dumps({'tipo': 'progreso', 'progreso': 100, 'archivo': 'Sin PDFs', 'mensaje': 'No se encontraron PDFs.'})}\n\n"
+            yield f"data: {json.dumps({'tipo': 'progreso', 'progreso': 100, 'archivo': 'Sin PDFs', 'mensaje': 'No se encontraron PDFs en las carpetas.'})}\n\n"
             yield f"data: {json.dumps({'tipo': 'fin'})}\n\n"
             return
 
@@ -267,7 +270,8 @@ def generador_indexacion_sse():
             yield f"data: {json.dumps({'tipo': 'progreso', 'progreso': porcentaje, 'archivo': nombre, 'mensaje': f'Procesando {i} de {total}'})}\n\n"
 
             try:
-                metricas = procesar_e_indexar_pdf(archivo, region=config.region or "mexico", db=db)
+                region_activa = config.region if config and config.region else "mexico"
+                metricas = procesar_e_indexar_pdf(archivo, region=region_activa, db=db)
                 yield f"data: {json.dumps({'tipo': 'telemetria', 'datos': metricas})}\n\n"
             except Exception as e:
                 print(f"[WARN INDEX] Error al indexar {nombre}: {e}")
@@ -283,7 +287,7 @@ def generador_indexacion_sse():
 
 
 @router.get("/stream")
-def stream_indexacion():
+def stream_indexacion(usuario_actual = Depends(obtener_usuario_actual)):
     return StreamingResponse(
         generador_indexacion_sse(),
         media_type="text/event-stream",

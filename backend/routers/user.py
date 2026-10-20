@@ -1,11 +1,7 @@
 # backend/routers/user.py
-import os
-import sys
-import uuid
 import json
 import datetime
-import subprocess
-from pathlib import Path
+import uuid
 from typing import Optional, List
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -13,89 +9,28 @@ from sqlalchemy.orm import Session
 from sqlalchemy import case
 
 from backend.database import get_db, Usuario, SesionChat, Mensaje, ConfiguracionApp
+from backend.auth import obtener_usuario_actual
 
 router = APIRouter(prefix="/api", tags=["Usuarios y Configuración"])
 
 
 # ==========================================
-# UTILIDADES DE VALIDACIÓN DE ONEDRIVE
-# ==========================================
-def obtener_rutas_onedrive_sistema() -> List[Path]:
-    """Detecta las rutas oficiales de OneDrive en Windows y macOS."""
-    rutas = []
-    # 1. Variables de entorno comunes
-    for var in ["OneDriveCommercial", "OneDriveConsumer", "OneDrive", "ONEDRIVE"]:
-        val = os.getenv(var)
-        if val and Path(val).is_dir():
-            rutas.append(Path(val).resolve())
-
-    # 2. macOS CloudStorage
-    mac_cloud = Path.home() / "Library" / "CloudStorage"
-    if mac_cloud.exists():
-        for d in mac_cloud.iterdir():
-            if d.is_dir() and "OneDrive" in d.name and d not in rutas:
-                rutas.append(d.resolve())
-
-    # 3. Directorio del perfil de usuario (Windows / macOS)
-    perfil = Path.home()
-    for d in perfil.iterdir():
-        if d.is_dir() and "onedrive" in d.name.lower() and d.resolve() not in rutas:
-            rutas.append(d.resolve())
-
-    return rutas
-
-
-def validar_carpeta_onedrive(ruta_str: str) -> Path:
-    """Verifica que la ruta exista y sea un directorio (permite cualquier carpeta local)."""
-    if not ruta_str or not ruta_str.strip():
-        raise HTTPException(status_code=400, detail="La ruta no puede estar vacía.")
-
-    ruta = Path(ruta_str.strip()).expanduser().resolve()
-    if not ruta.exists() or not ruta.is_dir():
-        raise HTTPException(
-            status_code=400,
-            detail=f"La ruta '{ruta_str}' no existe o no es un directorio válido."
-        )
-
-    return ruta
-
-
-# ==========================================
 # ESQUEMAS PYDANTIC
 # ==========================================
-class DirectorioValidacionRequest(BaseModel):
-    ruta: str
-
-
 class OnboardingRequest(BaseModel):
-    user_id: str
     nombre: str = Field(..., min_length=1, max_length=30)
     pronombre: str
     nombre_agente: Optional[str] = Field("Copiloto Técnico", max_length=25)
-    region: str = Field("mexico", pattern="^(mexico|centroamerica)$")
-    directorio_obligatorio: str
-    directorio_opcional_1: Optional[str] = None
-    directorio_opcional_2: Optional[str] = None
-
-
-class ConfigUpdateRequest(BaseModel):
-    region: Optional[str] = Field(None, pattern="^(mexico|centroamerica)$")
-    directorio_obligatorio: str
-    directorio_opcional_1: Optional[str] = None
-    directorio_opcional_2: Optional[str] = None
 
 
 class UserStatusResponse(BaseModel):
     registrado: bool
+    username: str
     nombre: Optional[str] = None
     pronombre: Optional[str] = None
     nombre_agente: Optional[str] = "Copiloto Técnico"
     disclaimer_aceptado: bool = False
-    onboarding_completado: bool = False
     region: str = "mexico"
-    directorio_obligatorio: Optional[str] = None
-    directorio_opcional_1: Optional[str] = None
-    directorio_opcional_2: Optional[str] = None
 
 
 class SessionResponse(BaseModel):
@@ -109,7 +44,6 @@ class RenameRequest(BaseModel):
 
 
 class DisclaimerRequest(BaseModel):
-    user_id: str
     no_volver_a_mostrar: bool
 
 
@@ -120,151 +54,74 @@ class MessageResponse(BaseModel):
 
 
 # ==========================================
-# SELECTORES ROBUSTOS AISLADOS CON TKINTER (VÍA CLI)
+# ENDPOINTS DE USUARIO Y CONFIGURACIÓN
 # ==========================================
-def _ejecutar_tkinter_aislado(flag: str) -> str:
-    """Ejecuta el propio binario en modo 'solo ventana' para velocidad extrema sin bucles."""
-    try:
-        flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
-        # Si está compilado, usa el .exe/.app. Si es desarrollo, usa python main.py
-        if getattr(sys, 'frozen', False):
-            comando = [sys.executable, flag]
-        else:
-            from backend.config import get_base_dir
-            script_path = str(get_base_dir() / "main.py")
-            comando = [sys.executable, script_path, flag]
-
-        resultado = subprocess.run(
-            comando, capture_output=True, text=True, creationflags=flags
-        )
-
-        # Tomamos solo la última línea por si alguna librería imprimió basura o banners antes
-        lineas = [l for l in resultado.stdout.split('\n') if l.strip()]
-        return lineas[-1].strip() if lineas else ""
-    except Exception as e:
-        print(f"[WARN DIALOGO TKINTER] Error: {e}")
-        return ""
-
-
-@router.post("/browse-directory")
-def examinar_directorio_nativo():
-    """Abre el explorador de carpetas usando Tkinter aislado."""
-    return {"ruta": _ejecutar_tkinter_aislado("--tk-dir")}
-
-
-@router.post("/browse-file")
-def examinar_archivo_nativo():
-    """Abre el explorador de archivos nativo (.json) usando Tkinter aislado."""
-    return {"ruta": _ejecutar_tkinter_aislado("--tk-file")}
-
-
-@router.post("/validate-directory")
-def validar_directorio(data: DirectorioValidacionRequest):
-    """Valida en tiempo real si una carpeta es de OneDrive antes de guardarla."""
-    ruta_validada = validar_carpeta_onedrive(data.ruta)
-    return {
-        "status": "ok",
-        "ruta_normalizada": str(ruta_validada)
-    }
-
-
-@router.get("/user/{user_id}", response_model=UserStatusResponse)
-def consultar_usuario(user_id: str, db: Session = Depends(get_db)):
-    usuario = db.query(Usuario).filter(Usuario.id == user_id).first()
+@router.get("/user/me", response_model=UserStatusResponse)
+def consultar_usuario(
+        usuario_actual=Depends(obtener_usuario_actual),
+        db: Session = Depends(get_db)
+):
+    """Devuelve la información del usuario autenticado."""
     config = db.query(ConfiguracionApp).first()
 
+    # Se considera completado solo si definió su pronombre y su nombre es distinto al username
+    ha_completado_onboarding = bool(
+        usuario_actual.pronombre and
+        usuario_actual.nombre and
+        usuario_actual.nombre != usuario_actual.username
+    )
+
     return UserStatusResponse(
-        registrado=bool(usuario and usuario.nombre),
-        nombre=usuario.nombre if usuario else None,
-        pronombre=usuario.pronombre if usuario else None,
-        nombre_agente=usuario.nombre_agente if usuario else "Copiloto Técnico",
-        disclaimer_aceptado=bool(usuario and usuario.disclaimer_aceptado),
-        onboarding_completado=bool(config and config.onboarding_completado),
-        region=config.region if config else "mexico",
-        directorio_obligatorio=config.directorio_obligatorio if config else None,
-        directorio_opcional_1=config.directorio_opcional_1 if config else None,
-        directorio_opcional_2=config.directorio_opcional_2 if config else None
+        registrado=ha_completado_onboarding,
+        username=usuario_actual.username,
+        nombre=usuario_actual.nombre if ha_completado_onboarding else "",
+        pronombre=usuario_actual.pronombre,
+        nombre_agente=usuario_actual.nombre_agente or "Copiloto Técnico",
+        disclaimer_aceptado=bool(usuario_actual.disclaimer_aceptado),
+        region=config.region if config else "mexico"
     )
 
 
 @router.post("/user/disclaimer")
-def registrar_disclaimer(data: DisclaimerRequest, db: Session = Depends(get_db)):
-    usuario = db.query(Usuario).filter(Usuario.id == data.user_id).first()
-    if not usuario:
-        usuario = Usuario(id=data.user_id)
-        db.add(usuario)
-
-    usuario.disclaimer_aceptado = data.no_volver_a_mostrar
+def registrar_disclaimer(
+        data: DisclaimerRequest,
+        usuario_actual=Depends(obtener_usuario_actual),
+        db: Session = Depends(get_db)
+):
+    usuario_actual.disclaimer_aceptado = data.no_volver_a_mostrar
     db.commit()
     return {"status": "ok"}
 
 
 @router.post("/user/onboarding")
-def guardar_onboarding(data: OnboardingRequest, db: Session = Depends(get_db)):
-    # 1. Validar directorio obligatorio
-    ruta_obligatoria = validar_carpeta_onedrive(data.directorio_obligatorio)
-
-    # 2. Validar opcionales si se proporcionaron
-    ruta_opc1 = str(validar_carpeta_onedrive(data.directorio_opcional_1)) if data.directorio_opcional_1 else None
-    ruta_opc2 = str(validar_carpeta_onedrive(data.directorio_opcional_2)) if data.directorio_opcional_2 else None
-
-    # 3. Guardar o actualizar usuario
-    usuario = db.query(Usuario).filter(Usuario.id == data.user_id).first()
-    if not usuario:
-        usuario = Usuario(id=data.user_id)
-        db.add(usuario)
-
-    usuario.nombre = data.nombre.strip()
-    usuario.pronombre = data.pronombre
-    usuario.nombre_agente = data.nombre_agente.strip() if data.nombre_agente else "Copiloto Técnico"
-
-    # 4. Guardar configuración de directorios y región
-    config = db.query(ConfiguracionApp).first()
-    if not config:
-        config = ConfiguracionApp(id=1)
-        db.add(config)
-
-    config.region = data.region
-    config.directorio_obligatorio = str(ruta_obligatoria)
-    config.directorio_opcional_1 = ruta_opc1
-    config.directorio_opcional_2 = ruta_opc2
-    config.onboarding_completado = True
-
-    db.commit()
-    return {"status": "ok"}
-
-
-@router.put("/config/directories")
-def actualizar_configuracion_directorios(data: ConfigUpdateRequest, db: Session = Depends(get_db)):
-    """Actualiza las carpetas desde el panel de ajustes (prohibido dejar 0 carpetas)."""
-    ruta_obligatoria = validar_carpeta_onedrive(data.directorio_obligatorio)
-    ruta_opc1 = str(validar_carpeta_onedrive(data.directorio_opcional_1)) if data.directorio_opcional_1 else None
-    ruta_opc2 = str(validar_carpeta_onedrive(data.directorio_opcional_2)) if data.directorio_opcional_2 else None
-
-    config = db.query(ConfiguracionApp).first()
-    if not config:
-        config = ConfiguracionApp(id=1)
-        db.add(config)
-
-    if data.region:
-        config.region = data.region
-    config.directorio_obligatorio = str(ruta_obligatoria)
-    config.directorio_opcional_1 = ruta_opc1
-    config.directorio_opcional_2 = ruta_opc2
+def guardar_onboarding(
+        data: OnboardingRequest,
+        usuario_actual=Depends(obtener_usuario_actual),
+        db: Session = Depends(get_db)
+):
+    """Guarda las preferencias personales del usuario."""
+    usuario_actual.nombre = data.nombre.strip()
+    usuario_actual.pronombre = data.pronombre
+    usuario_actual.nombre_agente = data.nombre_agente.strip() if data.nombre_agente else "Copiloto Técnico"
 
     db.commit()
     return {"status": "ok"}
 
 
 # ==========================================
-# ENDPOINTS DE SESIONES Y MENSAJES
+# ENDPOINTS DE SESIONES Y MENSAJES AISLADOS
 # ==========================================
-@router.get("/sessions/{user_id}", response_model=List[SessionResponse])
-def obtener_sesiones(user_id: str, db: Session = Depends(get_db)):
+
+@router.get("/sessions", response_model=List[SessionResponse])
+def obtener_sesiones(
+        usuario_actual=Depends(obtener_usuario_actual),
+        db: Session = Depends(get_db)
+):
+    """Obtiene SOLO las sesiones del usuario logueado."""
     sesiones = (
         db.query(SesionChat)
-        .filter(SesionChat.usuario_id == user_id)
+        .filter(SesionChat.usuario_id == usuario_actual.id)
         .order_by(
             case((SesionChat.fijado == True, 0), else_=1),
             SesionChat.fijado_en.desc(),
@@ -276,18 +133,15 @@ def obtener_sesiones(user_id: str, db: Session = Depends(get_db)):
     return [SessionResponse(id=s.id, titulo=s.titulo, fijado=bool(s.fijado)) for s in sesiones]
 
 
-@router.post("/sessions/{user_id}", response_model=SessionResponse)
-def crear_nueva_sesion(user_id: str, db: Session = Depends(get_db)):
-    usuario = db.query(Usuario).filter(Usuario.id == user_id).first()
-    if not usuario:
-        usuario = Usuario(id=user_id)
-        db.add(usuario)
-        db.commit()
-
+@router.post("/sessions", response_model=SessionResponse)
+def crear_nueva_sesion(
+        usuario_actual=Depends(obtener_usuario_actual),
+        db: Session = Depends(get_db)
+):
     ahora = datetime.datetime.utcnow()
     nueva = SesionChat(
         id=str(uuid.uuid4()),
-        usuario_id=user_id,
+        usuario_id=usuario_actual.id,
         titulo="Nueva consulta",
         actualizado_en=ahora,
         creado_en=ahora
@@ -298,10 +152,18 @@ def crear_nueva_sesion(user_id: str, db: Session = Depends(get_db)):
 
 
 @router.patch("/sessions/{session_id}/pin")
-def alternar_fijar_sesion(session_id: str, db: Session = Depends(get_db)):
-    sesion = db.query(SesionChat).filter(SesionChat.id == session_id).first()
+def alternar_fijar_sesion(
+        session_id: str,
+        usuario_actual=Depends(obtener_usuario_actual),
+        db: Session = Depends(get_db)
+):
+    sesion = db.query(SesionChat).filter(
+        SesionChat.id == session_id,
+        SesionChat.usuario_id == usuario_actual.id
+    ).first()
+
     if not sesion:
-        raise HTTPException(status_code=404, detail="Sesión no encontrada")
+        raise HTTPException(status_code=404, detail="Sesión no encontrada o acceso denegado.")
 
     if sesion.fijado:
         sesion.fijado = False
@@ -309,7 +171,7 @@ def alternar_fijar_sesion(session_id: str, db: Session = Depends(get_db)):
     else:
         fijados_actuales = (
             db.query(SesionChat)
-            .filter(SesionChat.usuario_id == sesion.usuario_id, SesionChat.fijado == True)
+            .filter(SesionChat.usuario_id == usuario_actual.id, SesionChat.fijado == True)
             .count()
         )
         if fijados_actuales >= 3:
@@ -325,10 +187,19 @@ def alternar_fijar_sesion(session_id: str, db: Session = Depends(get_db)):
 
 
 @router.patch("/sessions/{session_id}/rename")
-def renombrar_sesion(session_id: str, data: RenameRequest, db: Session = Depends(get_db)):
-    sesion = db.query(SesionChat).filter(SesionChat.id == session_id).first()
+def renombrar_sesion(
+        session_id: str,
+        data: RenameRequest,
+        usuario_actual=Depends(obtener_usuario_actual),
+        db: Session = Depends(get_db)
+):
+    sesion = db.query(SesionChat).filter(
+        SesionChat.id == session_id,
+        SesionChat.usuario_id == usuario_actual.id
+    ).first()
+
     if not sesion:
-        raise HTTPException(status_code=404, detail="Sesión no encontrada")
+        raise HTTPException(status_code=404, detail="Sesión no encontrada o acceso denegado.")
 
     sesion.titulo = data.titulo.strip()
     db.commit()
@@ -336,19 +207,30 @@ def renombrar_sesion(session_id: str, data: RenameRequest, db: Session = Depends
 
 
 @router.delete("/sessions/single/{session_id}")
-def eliminar_sesion_individual(session_id: str, db: Session = Depends(get_db)):
-    sesion = db.query(SesionChat).filter(SesionChat.id == session_id).first()
+def eliminar_sesion_individual(
+        session_id: str,
+        usuario_actual=Depends(obtener_usuario_actual),
+        db: Session = Depends(get_db)
+):
+    sesion = db.query(SesionChat).filter(
+        SesionChat.id == session_id,
+        SesionChat.usuario_id == usuario_actual.id
+    ).first()
+
     if not sesion:
-        raise HTTPException(status_code=404, detail="Sesión no encontrada")
+        raise HTTPException(status_code=404, detail="Sesión no encontrada o acceso denegado.")
 
     db.delete(sesion)
     db.commit()
     return {"status": "ok", "id": session_id}
 
 
-@router.delete("/sessions/{user_id}/clear-all")
-def eliminar_todas_las_sesiones(user_id: str, db: Session = Depends(get_db)):
-    sesiones = db.query(SesionChat).filter(SesionChat.usuario_id == user_id).all()
+@router.delete("/sessions/clear-all")
+def eliminar_todas_las_sesiones(
+        usuario_actual=Depends(obtener_usuario_actual),
+        db: Session = Depends(get_db)
+):
+    sesiones = db.query(SesionChat).filter(SesionChat.usuario_id == usuario_actual.id).all()
     for s in sesiones:
         db.delete(s)
     db.commit()
@@ -356,7 +238,19 @@ def eliminar_todas_las_sesiones(user_id: str, db: Session = Depends(get_db)):
 
 
 @router.get("/messages/{session_id}", response_model=List[MessageResponse])
-def obtener_historial_sesion(session_id: str, db: Session = Depends(get_db)):
+def obtener_historial_sesion(
+        session_id: str,
+        usuario_actual=Depends(obtener_usuario_actual),
+        db: Session = Depends(get_db)
+):
+    sesion = db.query(SesionChat).filter(
+        SesionChat.id == session_id,
+        SesionChat.usuario_id == usuario_actual.id
+    ).first()
+
+    if not sesion:
+        raise HTTPException(status_code=403, detail="Acceso denegado a esta sesión.")
+
     mensajes = (
         db.query(Mensaje)
         .filter(Mensaje.sesion_id == session_id)

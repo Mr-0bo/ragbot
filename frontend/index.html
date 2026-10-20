@@ -4,19 +4,56 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Agente de búsqueda</title>
-  <link rel="stylesheet" href="/frontend/css/styles.css?v=13">
+  <link rel="stylesheet" href="/frontend/css/styles.css?v=17">
 </head>
 <body>
 
   <!-- ======================================================== -->
-  <!-- BANNER FLOTANTE DE ACTUALIZACIÓN DE ONEDRIVE             -->
+  <!-- MODAL DE INICIO DE SESIÓN Y REGISTRO                     -->
+  <!-- ======================================================== -->
+  <div id="login-modal" class="modal-backdrop" style="display: none;" data-blocking="true">
+    <div class="onboarding-dialog">
+      <div class="onboarding-badge-icon">🔐</div>
+      <h2 id="login-title">Iniciar Sesión</h2>
+      <p id="login-desc">Ingresa tus credenciales para acceder.</p>
+
+      <div id="login-form">
+        <label class="field-label" for="login-username">Usuario</label>
+        <input type="text" id="login-username" class="input-text-wm" placeholder="Ej. mgarcia">
+
+        <label class="field-label" for="login-password" style="margin-top: 10px;">Contraseña</label>
+        <input type="password" id="login-password" class="input-text-wm" placeholder="••••••••" onkeydown="if(event.key === 'Enter') ejecutarLogin()">
+
+        <div class="modal-actions-row" style="margin-top: 24px; flex-direction: column; gap: 10px;">
+          <button type="button" class="btn-confirm" style="width: 100%;" onclick="ejecutarLogin()">Entrar al sistema</button>
+          <button type="button" class="btn-cancel" style="width: 100%; border: none; background: transparent; text-decoration: underline;" onclick="mostrarRegistro()">¿No tienes cuenta? Regístrate</button>
+        </div>
+      </div>
+
+      <div id="register-form" style="display: none;">
+        <label class="field-label" for="reg-username">Usuario corporativo</label>
+        <input type="text" id="reg-username" class="input-text-wm" placeholder="Ej. mgarcia">
+
+        <label class="field-label" for="reg-password" style="margin-top: 10px;">Contraseña</label>
+        <input type="password" id="reg-password" class="input-text-wm" placeholder="Mínimo 6 caracteres (letras y números)" maxlength="60">
+
+        <div class="modal-actions-row" style="margin-top: 24px; flex-direction: column; gap: 10px;">
+          <button type="button" class="btn-confirm" style="width: 100%;" onclick="ejecutarRegistro()">Crear cuenta</button>
+          <button type="button" class="btn-cancel" style="width: 100%; border: none; background: transparent;" onclick="mostrarLogin()">← Volver a inicio de sesión</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ======================================================== -->
+  <!-- BANNER FLOTANTE DE ACTUALIZACIÓN DEL SERVIDOR            -->
   <!-- ======================================================== -->
   <div id="sync-notification-banner" class="sync-banner" style="display: none;">
     <div class="sync-banner-content">
       <span class="sync-banner-icon">🔄</span>
       <div class="sync-banner-text">
-        <strong id="sync-banner-title">Cambios detectados en SharePoint/OneDrive</strong>
-        <p id="sync-banner-desc">Existen nuevos archivos o actualizaciones en tus carpetas normativas.</p>
+        <strong id="sync-banner-title">Actualización en el servidor</strong>
+        <p id="sync-banner-desc">Existen nuevos archivos en el repositorio central.</p>
       </div>
     </div>
     <div class="sync-banner-actions">
@@ -26,7 +63,7 @@
   </div>
 
   <!-- ======================================================== -->
-  <!-- MODAL DISCLAIMER / RESPONSABILIDAD TÉCNICA               -->
+  <!-- MODAL DISCLAIMER                                         -->
   <!-- ======================================================== -->
   <div id="disclaimer-modal" class="modal-backdrop" style="display: none;">
     <div class="disclaimer-dialog">
@@ -37,7 +74,7 @@
       </p>
       <div class="disclaimer-callout">
         Los modelos de IA pueden interpretar especificaciones de forma imprecisa.
-        <strong>Bajo ninguna circunstancia se debe dar por sentado el resultado arrojado</strong> para decisiones constructivas o de ingeniería sin contrastar directamente las fuentes normativas oficiales vigentes citadas.
+        <strong>Bajo ninguna circunstancia se debe dar por sentado el resultado arrojado</strong> sin contrastar directamente las fuentes oficiales vigentes citadas.
       </div>
 
       <div class="disclaimer-footer">
@@ -52,20 +89,20 @@
   </div>
 
   <!-- ======================================================== -->
-  <!-- MODAL ONBOARDING / WIZARD EN DOS PASOS (BLOQUEANTE)      -->
+  <!-- MODAL ONBOARDING                                         -->
   <!-- ======================================================== -->
   <div id="onboarding-modal" class="modal-backdrop" style="display: none;" data-blocking="true">
-    <div class="onboarding-dialog onboarding-expanded">
+    <div class="onboarding-dialog">
       <div class="onboarding-badge-icon" id="wizard-badge-icon">👋</div>
       <h2 id="modal-title">¡Bienvenido!</h2>
-      <p id="modal-desc">Configuremos tu perfil para empezar.</p>
+      <p id="modal-desc">Configuremos tu perfil personal para empezar.</p>
 
       <div id="wizard-step-1" class="wizard-step">
         <label class="field-label" for="user-name-input">Tu nombre o alias *</label>
         <input type="text" id="user-name-input" class="input-text-wm" placeholder="Ej. Mario García" maxlength="30">
 
         <label class="field-label" for="agent-name-input" style="margin-top: 10px;">Nombre para tu agente</label>
-        <input type="text" id="agent-name-input" class="input-text-wm" placeholder="Ej. Agente de búsqueda" maxlength="25">
+        <input type="text" id="agent-name-input" class="input-text-wm" placeholder="Ej. Copiloto Técnico" maxlength="25">
 
         <label class="field-label" style="margin-top: 10px;">Trato gramatical preferido</label>
         <div class="pronoun-group">
@@ -75,116 +112,19 @@
         </div>
 
         <div class="modal-actions-row" style="margin-top: 24px;">
-          <button type="button" class="btn-cancel" id="btn-cancel-profile" style="display: none;" onclick="cerrarModalPerfil()">Cancelar</button>
-          <button type="button" class="btn-confirm" id="btn-wizard-next" onclick="avanzarPaso2()">Continuar →</button>
-        </div>
-      </div>
-
-      <div id="wizard-step-2" class="wizard-step" style="display: none;">
-        <label class="field-label">Región activa de consulta *</label>
-        <div class="region-selector-grid" style="margin-bottom: 16px;">
-          <div class="region-card active" id="region-card-mexico" onclick="seleccionarRegion('mexico')">
-            <span class="region-flag">🇲🇽</span>
-            <div class="region-info">
-              <strong>México</strong>
-              <small>Criterios y normas nacionales</small>
-            </div>
-          </div>
-          <div class="region-card" id="region-card-cam" onclick="seleccionarRegion('centroamerica')">
-            <span class="region-flag">🌎</span>
-            <div class="region-info">
-              <strong>Centroamérica</strong>
-              <small>Criterios técnicos regionales</small>
-            </div>
-          </div>
-        </div>
-
-        <label class="field-label">Repositorio de OneDrive sincronizado *</label>
-        <p class="field-help-text">
-          Selecciona tus carpetas con vigencia <strong>2025-2026</strong>. Solo se procesarán archivos <strong>.PDF</strong>.
-        </p>
-
-        <label class="field-label" for="folder-mandatory-input" style="font-size: 11.5px;">Carpeta principal (Obligatoria) *</label>
-        <div class="input-browse-row">
-          <input type="text" id="folder-mandatory-input" class="input-text-wm" placeholder="Ruta sincronizada de OneDrive..." onchange="validarRutaInput(this)">
-          <button type="button" class="btn-browse" onclick="abrirSelectorDirectorio('folder-mandatory-input')">Examinar...</button>
-        </div>
-        <span class="path-status-badge" id="badge-mandatory"></span>
-
-        <label class="field-label" for="folder-opc1-input" style="font-size: 11.5px; margin-top: 10px;">Carpeta adicional 1 (Opcional)</label>
-        <div class="input-browse-row">
-          <input type="text" id="folder-opc1-input" class="input-text-wm" placeholder="Ruta adicional..." onchange="validarRutaInput(this)">
-          <button type="button" class="btn-browse" onclick="abrirSelectorDirectorio('folder-opc1-input')">Examinar...</button>
-        </div>
-        <span class="path-status-badge" id="badge-opc1"></span>
-
-        <label class="field-label" for="folder-opc2-input" style="font-size: 11.5px; margin-top: 10px;">Carpeta adicional 2 (Opcional)</label>
-        <div class="input-browse-row">
-          <input type="text" id="folder-opc2-input" class="input-text-wm" placeholder="Ruta adicional..." onchange="validarRutaInput(this)">
-          <button type="button" class="btn-browse" onclick="abrirSelectorDirectorio('folder-opc2-input')">Examinar...</button>
-        </div>
-        <span class="path-status-badge" id="badge-opc2"></span>
-
-        <div id="onboarding-progress-container" class="progress-box-card" style="display: none; margin-top: 16px;">
-          <div class="progress-header">
-            <span class="progress-title-text" id="progress-status-title">Indexando documentos...</span>
-            <span class="progress-percentage-text" id="progress-percentage">0%</span>
-          </div>
-          <div class="progress-track">
-            <div class="progress-fill" id="progress-bar-fill" style="width: 0%;"></div>
-          </div>
-          <p class="progress-current-file" id="progress-current-filename">Iniciando lectura...</p>
-        </div>
-
-        <div class="modal-actions-row" style="margin-top: 24px;">
-          <button type="button" class="btn-cancel" onclick="volverPaso1()">← Volver</button>
-          <div class="tooltip-wrapper" id="btn-start-tooltip" data-tooltip="Debes validar la carpeta obligatoria para comenzar">
-            <button type="button" class="btn-confirm btn-disabled" id="btn-start-app" onclick="iniciarGuardadoEIndexacion()">
-              Indexar y Comenzar
-            </button>
-          </div>
+          <button type="button" class="btn-confirm" id="btn-wizard-next" style="width: 100%;" onclick="finalizarOnboarding()">Guardar y Comenzar</button>
         </div>
       </div>
     </div>
   </div>
 
   <!-- ======================================================== -->
-  <!-- MODAL CONFIGURACIÓN TÉCNICA (DESDE SIDEBAR)              -->
+  <!-- MODAL SINCRONIZACIÓN                                     -->
   <!-- ======================================================== -->
   <div id="settings-modal" class="modal-backdrop" style="display: none;">
     <div class="onboarding-dialog onboarding-expanded">
-      <h2>Ajustes y Repositorios</h2>
-      <p>Modifica tus rutas sincronizadas de OneDrive o busca cambios en SharePoint.</p>
-
-      <label class="field-label">Región activa</label>
-      <div class="region-selector-grid" style="margin-bottom: 16px;">
-        <div class="region-card" id="settings-region-mexico" onclick="cambiarRegionAjustes('mexico')">
-          <span class="region-flag">🇲🇽</span>
-          <div class="region-info"><strong>México</strong></div>
-        </div>
-        <div class="region-card" id="settings-region-cam" onclick="cambiarRegionAjustes('centroamerica')">
-          <span class="region-flag">🌎</span>
-          <div class="region-info"><strong>Centroamérica</strong></div>
-        </div>
-      </div>
-
-      <label class="field-label" for="settings-mandatory-input">Carpeta OneDrive (Obligatoria) *</label>
-      <div class="input-browse-row">
-        <input type="text" id="settings-mandatory-input" class="input-text-wm" onchange="validarRutaInput(this)">
-        <button type="button" class="btn-browse" onclick="abrirSelectorDirectorio('settings-mandatory-input')">Examinar...</button>
-      </div>
-
-      <label class="field-label" for="settings-opc1-input" style="margin-top: 10px;">Carpeta adicional 1</label>
-      <div class="input-browse-row">
-        <input type="text" id="settings-opc1-input" class="input-text-wm" onchange="validarRutaInput(this)">
-        <button type="button" class="btn-browse" onclick="abrirSelectorDirectorio('settings-opc1-input')">Examinar...</button>
-      </div>
-
-      <label class="field-label" for="settings-opc2-input" style="margin-top: 10px;">Carpeta adicional 2</label>
-      <div class="input-browse-row">
-        <input type="text" id="settings-opc2-input" class="input-text-wm" onchange="validarRutaInput(this)">
-        <button type="button" class="btn-browse" onclick="abrirSelectorDirectorio('settings-opc2-input')">Examinar...</button>
-      </div>
+      <h2>Servidor y Sincronización</h2>
+      <p>Comprueba si hay nuevos documentos indexados en el repositorio central de la red.</p>
 
       <div id="settings-progress-container" class="progress-box-card" style="display: none; margin-top: 14px;">
         <div class="progress-header">
@@ -199,23 +139,22 @@
 
       <div class="modal-actions-row" style="margin-top: 22px; justify-content: space-between;">
         <button type="button" class="btn-secondary-action" onclick="comprobarActualizacionesManuales()">
-          🔍 Buscar cambios
+          🔄 Sincronizar Repositorio
         </button>
         <div style="display: flex; gap: 8px;">
           <button type="button" class="btn-cancel" onclick="cerrarModalAjustes()">Cerrar</button>
-          <button type="button" class="btn-confirm" onclick="guardarAjustesDirectorios()">Guardar cambios</button>
         </div>
       </div>
     </div>
   </div>
 
   <!-- ======================================================== -->
-  <!-- MODAL PERFIL DE USUARIO                                  -->
+  <!-- MODAL PERFIL                                             -->
   <!-- ======================================================== -->
   <div id="profile-modal" class="modal-backdrop" style="display: none;">
     <div class="onboarding-dialog">
       <h2>Perfil de Usuario</h2>
-      <p>Modifica tu identidad y el nombre de tu asistente.</p>
+      <p>Modifica tu identidad, tu asistente y tu seguridad de acceso.</p>
 
       <label class="field-label" for="profile-name-input">Tu nombre o alias *</label>
       <input type="text" id="profile-name-input" class="input-text-wm" maxlength="30">
@@ -230,15 +169,50 @@
         <button type="button" class="btn-choice" id="profile-pronoun-neutro" onclick="seleccionarPronombrePerfil('neutro', this)">Neutro</button>
       </div>
 
-      <div class="modal-actions-row" style="margin-top: 24px;">
-        <button type="button" class="btn-cancel" onclick="cerrarModalPerfil()">Cancelar</button>
-        <button type="button" class="btn-confirm" onclick="guardarAjustesPerfil()">Guardar perfil</button>
+      <div style="margin-top: 16px; margin-bottom: 20px; border-top: 1px solid var(--border-subtle); padding-top: 14px;">
+        <label class="field-label">Seguridad de la cuenta</label>
+        <button type="button" class="btn-secondary-action" style="width: 100%; display: flex; align-items: center; justify-content: center; gap: 8px;" onclick="abrirModalCambiarPassword()">
+          🔑 Cambiar contraseña
+        </button>
+      </div>
+
+      <div class="modal-actions-row" style="margin-top: 14px; justify-content: space-between;">
+        <button type="button" class="btn-cancel" style="color: #ef4444; border-color: #ef4444;" onclick="cerrarSesion()">Cerrar sesión</button>
+        <div style="display: flex; gap: 8px;">
+          <button type="button" class="btn-cancel" onclick="cerrarModalPerfil()">Cancelar</button>
+          <button type="button" class="btn-confirm" onclick="guardarAjustesPerfil()">Guardar perfil</button>
+        </div>
       </div>
     </div>
   </div>
 
   <!-- ======================================================== -->
-  <!-- MODAL DE IMPORTACIÓN (NUEVO)                             -->
+  <!-- MODAL CAMBIAR CONTRASEÑA                                 -->
+  <!-- ======================================================== -->
+  <div id="change-password-modal" class="modal-backdrop" style="display: none; z-index: 1100;">
+    <div class="custom-dialog-card" style="text-align: left; max-width: 440px;">
+      <div class="custom-dialog-badge" style="text-align: center; margin-bottom: 8px;">🔐</div>
+      <h2 style="text-align: center; margin-bottom: 4px;">Cambiar Contraseña</h2>
+      <p style="text-align: center; margin-bottom: 18px;">Debe contener entre 6 y 60 caracteres e incluir letras y números.</p>
+
+      <label class="field-label" for="cp-current-password">Contraseña actual</label>
+      <input type="password" id="cp-current-password" class="input-text-wm" placeholder="••••••••" maxlength="60">
+
+      <label class="field-label" for="cp-new-password" style="margin-top: 10px;">Nueva contraseña</label>
+      <input type="password" id="cp-new-password" class="input-text-wm" placeholder="Al menos 6 caracteres alfanuméricos" maxlength="60">
+
+      <label class="field-label" for="cp-confirm-password" style="margin-top: 10px;">Confirmar nueva contraseña</label>
+      <input type="password" id="cp-confirm-password" class="input-text-wm" placeholder="Vuelve a escribir la nueva contraseña" maxlength="60">
+
+      <div class="modal-actions-row" style="margin-top: 22px;">
+        <button type="button" class="btn-cancel" onclick="cerrarModalCambiarPassword()">Cancelar</button>
+        <button type="button" class="btn-confirm" onclick="ejecutarCambioPassword()">Actualizar clave</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ======================================================== -->
+  <!-- MODAL IMPORTAR                                           -->
   <!-- ======================================================== -->
   <div id="import-modal" class="modal-backdrop" style="display: none;">
     <div class="onboarding-dialog">
@@ -246,21 +220,20 @@
       <h2>Importar Consulta</h2>
       <p>Selecciona un archivo <strong>.json</strong> con un historial previamente exportado para restaurarlo.</p>
 
-      <label class="field-label" for="import-path-input" style="margin-top: 16px;">Ruta del archivo JSON *</label>
+      <label class="field-label" for="import-file-input" style="margin-top: 16px;">Seleccionar archivo JSON *</label>
       <div class="input-browse-row">
-        <input type="text" id="import-path-input" class="input-text-wm" placeholder="Ej. /Usuarios/mario/Descargas/chat.json">
-        <button type="button" class="btn-browse" onclick="abrirSelectorArchivoNativo()">Examinar...</button>
+        <input type="file" id="import-file-input" class="input-text-wm" accept=".json" style="padding: 6px; font-size: 13px;">
       </div>
 
       <div class="modal-actions-row" style="margin-top: 24px;">
         <button type="button" class="btn-cancel" onclick="cerrarModalImportar()">Cancelar</button>
-        <button type="button" class="btn-confirm" onclick="ejecutarImportacion()">Importar chat</button>
+        <button type="button" class="btn-confirm" onclick="ejecutarImportacionWeb()">Importar chat</button>
       </div>
     </div>
   </div>
 
   <!-- ======================================================== -->
-  <!-- MODALES DE SESIÓN (RENOMBRAR, EXPORTAR, DIÁLOGOS)        -->
+  <!-- MODALES DE SESIÓN Y DIÁLOGOS                             -->
   <!-- ======================================================== -->
   <div id="rename-modal" class="modal-backdrop" style="display: none;">
     <div class="custom-dialog-card">
@@ -284,14 +257,14 @@
           <div class="export-icon">🌐</div>
           <div class="export-info">
             <span class="export-title">Página Web (.HTML)</span>
-            <span class="export-desc">Diseño limpio y estilizado con el tema visual actual (claro/oscuro).</span>
+            <span class="export-desc">Diseño limpio y estilizado con el tema visual actual.</span>
           </div>
         </div>
         <div class="export-card" onclick="ejecutarExportacion('json')">
           <div class="export-icon">{ }</div>
           <div class="export-info">
             <span class="export-title">Archivo de Datos (.JSON)</span>
-            <span class="export-desc">Texto plano con remitente, rol, contenido y fuentes estructuradas.</span>
+            <span class="export-desc">Texto plano con formato estructurado de mensajes y fuentes.</span>
           </div>
         </div>
       </div>
@@ -314,17 +287,14 @@
   </div>
 
   <!-- ======================================================== -->
-  <!-- CONTENEDOR GENERAL DE LA APLICACIÓN                      -->
+  <!-- CONTENEDOR GENERAL                                       -->
   <!-- ======================================================== -->
   <div class="app-wrapper">
-    <!-- Sidebar -->
     <aside class="sidebar">
       <div class="brand-badge">
-        <span class="brand-title">AGENTE DE BÚSQUEDA</span>
-        <span class="region-pill" id="sidebar-region-badge">MEX</span>
+        <span class="brand-title">Agente de Búsqueda</span>
       </div>
 
-      <!-- Barra de acciones: Nueva consulta + Limpiar chats -->
       <div class="sidebar-actions-row">
         <button class="btn-new-chat" onclick="crearSesion()">
           <span>+</span> Nueva consulta
@@ -343,20 +313,18 @@
       <span class="session-section-title">Historial de consultas</span>
       <ul class="session-list" id="session-list"></ul>
 
-      <!-- Footer inferior de la barra lateral -->
       <div class="sidebar-footer">
         <div class="sidebar-footer-actions">
           <button class="user-profile-btn" onclick="abrirModalPerfil()" title="Editar perfil">
             <div class="user-avatar" id="sidebar-user-avatar">M</div>
             <div class="user-meta">
-              <span class="user-name-text" id="sidebar-user-name">Mario García</span>
-              <span class="user-sub-text" id="sidebar-user-pronoun">Trato: Él</span>
+              <span class="user-name-text" id="sidebar-user-name">...</span>
+              <span class="user-sub-text" id="sidebar-user-pronoun">...</span>
             </div>
           </button>
           <button class="settings-icon-btn" onclick="abrirModalAjustes()" title="Ajustes de repositorios">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <circle cx="12" cy="12" r="3"></circle>
-              <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+              <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.92-10.26l-3.27 3.27"></path>
             </svg>
           </button>
         </div>
@@ -374,9 +342,7 @@
       </div>
     </aside>
 
-    <!-- Ventana Principal del Chat -->
     <main class="main-chat">
-      <!-- Topbar Fija -->
       <header class="chat-topbar">
         <div class="topbar-left">
           <div class="agent-avatar" id="agent-avatar-icon"></div>
@@ -387,10 +353,8 @@
         </div>
 
         <div class="topbar-right">
-          <!-- Botón Superior: AHORA ES EXCLUSIVO PARA IMPORTAR -->
-          <button class="topbar-action-btn" onclick="abrirModalImportar()" title="Importar un chat">
+          <button class="topbar-action-btn" onclick="abrirModalImportar()" title="Importar un chat JSON">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <!-- Ícono modificado apuntando hacia abajo a la bandeja -->
               <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
               <polyline points="17 8 12 13 7 8"></polyline>
               <line x1="12" y1="13" x2="12" y2="3"></line>
@@ -401,14 +365,18 @@
 
       <div class="chat-scroll" id="chat-scroll"></div>
 
+      <!-- Dock de Entrada con Botón de Enviar y Botón de Cancelación -->
       <div class="input-dock">
         <div class="input-box-wrapper">
           <div class="input-box">
             <input type="text" id="query-input" placeholder="Realiza una consulta..." onkeydown="alPresionarTecla(event)">
-            <button class="btn-send" id="btn-send-query" onclick="enviarMensaje()">↑</button>
+            <!-- Botón de Envío -->
+            <button class="btn-send" id="btn-send-query" onclick="enviarMensaje()" title="Enviar consulta">↑</button>
+            <!-- Botón de Cancelación (Oculto por defecto) -->
+            <button class="btn-send btn-stop" id="btn-stop-query" onclick="cancelarGeneracion()" title="Detener respuesta" style="display: none; background: #ef4444;">■</button>
           </div>
           <p class="input-disclaimer-note">
-            Este agente utiliza modelos de Inteligencia Artificial y puede cometer errores. Verifica siempre las especificaciones en las fuentes oficiales antes de tomar decisiones.
+            Este agente utiliza modelos de IA y puede cometer errores. Verifica siempre las especificaciones en las fuentes oficiales antes de tomar decisiones.
           </p>
         </div>
       </div>
@@ -416,7 +384,6 @@
   </div>
 
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-  <script src="/frontend/js/app.js?v=13"></script>
+  <script src="/frontend/js/app.js?v=23"></script>
 </body>
 </html>
-

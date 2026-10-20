@@ -1,11 +1,19 @@
 torch
+
 # ==========================================
 # 🚀 FRAMEWORK WEB Y SERVIDOR
 # ==========================================
 fastapi
 uvicorn
+python-multipart
 pydantic
 pydantic-settings
+
+# ==========================================
+# 🛡️ SEGURIDAD Y AUTENTICACIÓN (MULTI-USUARIO)
+# ==========================================
+passlib[bcrypt]
+python-jose[cryptography]
 
 # ==========================================
 # 🗄️ BASE DE DATOS Y ORM (METADATOS)
@@ -35,5 +43,3 @@ pillow
 # 🛠️ UTILIDADES DEL SISTEMA
 # ==========================================
 python-dotenv
-platformdirs
-matplotlib

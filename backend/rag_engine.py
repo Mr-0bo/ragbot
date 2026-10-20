@@ -9,10 +9,10 @@ from sqlalchemy.orm import Session
 from backend.database import Usuario, SesionChat, Mensaje, ConfiguracionApp
 from backend.llm_orchestrator import (
     generar_respuesta_chat_async,
-    clasificar_intencion,
+    clasificar_intencion_async,  # <-- Importamos la versión asíncrona
     reformular_pregunta_con_historial_async
 )
-from backend.prompts import (
+from backend.prompts import ( # Asegúrate de que el nombre del archivo coincida (prompts / prompt_templates)
     generar_system_prompt,
     generar_prompt_consulta,
     generar_prompt_conversacional
@@ -68,7 +68,8 @@ async def ejecutar_consulta_async(user_id: str, session_id: str, pregunta: str, 
         pronombre=usuario.pronombre or "neutro"
     )
 
-    intencion = clasificar_intencion(pregunta)
+    # <-- CAMBIO: Ejecución asíncrona para no bloquear a otros usuarios en LAN
+    intencion = await clasificar_intencion_async(pregunta)
     print(f"\n[ROUTER INTENCIÓN LOCAL] '{pregunta}' -> Clasificado como: {intencion}")
 
     if intencion == "CONVERSACIONAL":
@@ -85,7 +86,7 @@ async def ejecutar_consulta_async(user_id: str, session_id: str, pregunta: str, 
         subconsultas = await reformular_pregunta_con_historial_async(historial_lista, pregunta)
         print(f"[REFORMULACIÓN / DESGLOSE (ASYNC)] -> {subconsultas}")
 
-        # Búsqueda Densa Pura
+        # Búsqueda Densa Pura delegada a hilo secundario
         fragmentos_validos = await asyncio.to_thread(
             buscar_fragmentos,
             consultas=subconsultas,
@@ -114,7 +115,6 @@ async def ejecutar_consulta_async(user_id: str, session_id: str, pregunta: str, 
 
             # Extraemos ESTRICTAMENTE las fuentes que el modelo haya citado
             fuentes_unicas = extraer_fuentes_citadas(respuesta_texto)
-            # NOTA: Se eliminó el código que forzaba las fuentes en el frontend
         else:
             print("\n[AVISO] No se encontraron documentos relevantes en Qdrant.\n")
             prompt_usuario = (

@@ -14,7 +14,8 @@ from ingestion.document_parser import extraer_markdown_de_pdf
 from backend.search_service import (
     eliminar_documento_por_ruta,
     indexar_chunks_documento,
-    get_embedding_model
+    get_embedding_model,
+    formatear_vector_disperso
 )
 
 
@@ -113,8 +114,8 @@ def auditar_directorio(directorio_raiz: Path, region: str = "mexico") -> dict:
     db = SessionLocal()
     try:
         registros_bd = {
-            doc.ruta_relativa: doc
-            for doc in db.query(DocumentoNormativo).filter(DocumentoNormativo.region == region).all()
+            doc.ruta_absoluta: doc
+            for doc in db.query(DocumentoNormativo).all()
         }
 
         nuevos = []
@@ -122,29 +123,24 @@ def auditar_directorio(directorio_raiz: Path, region: str = "mexico") -> dict:
         sin_cambios = []
         encontrados_en_disco = set()
 
-        for pdf in directorio_raiz.rglob("*"):
-            if not pdf.is_file() or pdf.suffix.lower() != ".pdf":
-                continue
-            if pdf.name.startswith("~") or pdf.name.startswith("."):
+        for pdf in directorio_raiz.rglob("*.pdf"):
+            if not pdf.is_file() or pdf.name.startswith("._") or pdf.name.startswith("~"):
                 continue
 
-            if settings.CARPETA_VIGENCIA.lower() not in str(pdf).lower():
-                continue
-
-            ruta_rel = str(pdf.relative_to(directorio_raiz))
-            encontrados_en_disco.add(ruta_rel)
+            ruta_abs = str(pdf.resolve())
+            encontrados_en_disco.add(ruta_abs)
 
             if not forzar_hidratacion_onedrive(pdf):
                 continue
 
             hash_actual = calcular_hash_md5(pdf)
 
-            if ruta_rel not in registros_bd:
-                nuevos.append((pdf, ruta_rel, hash_actual))
-            elif registros_bd[ruta_rel].hash_md5 != hash_actual:
-                modificados.append((pdf, ruta_rel, hash_actual))
+            if ruta_abs not in registros_bd:
+                nuevos.append((pdf, ruta_abs, hash_actual))
+            elif registros_bd[ruta_abs].hash_md5 != hash_actual:
+                modificados.append((pdf, ruta_abs, hash_actual))
             else:
-                sin_cambios.append(ruta_rel)
+                sin_cambios.append(ruta_abs)
 
         eliminados = [r for r in registros_bd.keys() if r not in encontrados_en_disco]
 
@@ -160,15 +156,13 @@ def auditar_directorio(directorio_raiz: Path, region: str = "mexico") -> dict:
 
 def procesar_e_indexar_archivo(
         ruta_pdf: Path,
-        ruta_rel: str,
+        ruta_abs: str,
         hash_md5: str,
         region: str,
         embedding_model
 ) -> int:
     paginas = extraer_markdown_de_pdf(ruta_pdf, verbose=False)
-    puntos_qdrant = []
     total_chunks = 0
-
     textos_chunk = []
     metadatos_chunk = []
 
@@ -178,6 +172,8 @@ def procesar_e_indexar_archivo(
         chunks = dividir_en_chunks(texto_limpio, chunk_size=1200, overlap=200)
 
         for idx, chunk in enumerate(chunks):
+            if len(chunk) < 20:
+                continue
             total_chunks += 1
             textos_chunk.append(chunk)
             metadatos_chunk.append({
@@ -189,38 +185,33 @@ def procesar_e_indexar_archivo(
     if not textos_chunk:
         return 0
 
-    lote_size = 64 # Cambiar a 16 o 32 en Mac M4
+    # Limpiar vectores previos del archivo
+    eliminar_documento_por_ruta(ruta_abs)
+
+    # Lote óptimo para inferencia híbrida
+    lote_size = 12
+    puntos_qdrant = []
 
     for b in range(0, len(textos_chunk), lote_size):
         sub_lote = textos_chunk[b: b + lote_size]
         salida = embedding_model.encode(
             sub_lote,
-            batch_size=lote_size,
+            batch_size=len(sub_lote),
             max_length=512,
             return_dense=True,
-            return_sparse=False  # --- MODO DISPERSO COMENTADO ---
+            return_sparse=True
         )
 
         v_densos = salida["dense_vecs"]
-
-        # --- MODO DISPERSO COMENTADO ---
-        # v_lexical = salida["lexical_weights"]
+        v_lexical = salida["lexical_weights"]
 
         for sub_i, meta_idx in enumerate(range(b, b + len(sub_lote))):
             meta = metadatos_chunk[meta_idx]
-            point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{ruta_rel}_{meta['pagina']}_{meta['sub_idx']}"))
-
-            # --- MODO DISPERSO COMENTADO ---
-            # lexical_dict = v_lexical[sub_i]
-            # indices = [int(k) for k in lexical_dict.keys()]
-            # values = [float(v) for v in lexical_dict.values()]
-            # vector_hibrido = {
-            #     "dense": v_densos[sub_i].tolist(),
-            #     "sparse": models.SparseVector(indices=indices, values=values)
-            # }
+            point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{ruta_abs}_{meta['pagina']}_{meta['sub_idx']}"))
 
             vector_payload = {
-                "dense": v_densos[sub_i].tolist()
+                "dense": v_densos[sub_i].tolist(),
+                "sparse": formatear_vector_disperso(v_lexical[sub_i])
             }
 
             puntos_qdrant.append(
@@ -229,7 +220,8 @@ def procesar_e_indexar_archivo(
                     vector=vector_payload,
                     payload={
                         "documento": ruta_pdf.name,
-                        "ruta_relativa": ruta_rel,
+                        "ruta_relativa": ruta_abs,
+                        "ruta_absoluta": ruta_abs,
                         "pagina": meta["pagina"],
                         "contenido": meta["texto"],
                         "region": region.lower(),
@@ -241,14 +233,14 @@ def procesar_e_indexar_archivo(
 
     db = SessionLocal()
     try:
-        doc = db.query(DocumentoNormativo).filter(DocumentoNormativo.ruta_relativa == ruta_rel).first()
+        doc = db.query(DocumentoNormativo).filter(DocumentoNormativo.ruta_absoluta == ruta_abs).first()
         stat = ruta_pdf.stat()
         if not doc:
             doc = DocumentoNormativo(
-                id=hash_md5,
+                id=str(uuid.uuid4()),
                 nombre_archivo=ruta_pdf.name,
-                ruta_absoluta=str(ruta_pdf.resolve()),
-                ruta_relativa=ruta_rel,
+                ruta_absoluta=ruta_abs,
+                ruta_relativa=ruta_abs,
                 region=region.lower(),
                 hash_md5=hash_md5,
                 tamanio_bytes=stat.st_size,
@@ -286,27 +278,23 @@ def sincronizar_directorio(
     db = SessionLocal()
 
     try:
-        for ruta_rel in auditoria["eliminados"]:
-            eliminar_documento_por_ruta(ruta_rel)
-            db.query(DocumentoNormativo).filter(DocumentoNormativo.ruta_relativa == ruta_rel).delete()
+        for ruta_abs in auditoria["eliminados"]:
+            eliminar_documento_por_ruta(ruta_abs)
+            db.query(DocumentoNormativo).filter(DocumentoNormativo.ruta_absoluta == ruta_abs).delete()
         db.commit()
     finally:
         db.close()
 
-    for _, ruta_rel, _ in auditoria["modificados"]:
-        eliminar_documento_por_ruta(ruta_rel)
-
     a_procesar = auditoria["nuevos"] + auditoria["modificados"]
     total = len(a_procesar)
-
     modelo_embedding = get_embedding_model()
 
     chunks_totales = 0
-    for idx, (pdf, ruta_rel, hash_md5) in enumerate(a_procesar, start=1):
+    for idx, (pdf, ruta_abs, hash_md5) in enumerate(a_procesar, start=1):
         if callback_progreso:
             callback_progreso(idx, total, pdf.name)
 
-        chunks = procesar_e_indexar_archivo(pdf, ruta_rel, hash_md5, region, modelo_embedding)
+        chunks = procesar_e_indexar_archivo(pdf, ruta_abs, hash_md5, region, modelo_embedding)
         chunks_totales += chunks
 
     return {
@@ -316,10 +304,3 @@ def sincronizar_directorio(
         "sin_cambios": len(auditoria["sin_cambios"]),
         "chunks_generados": chunks_totales,
     }
-
-
-if __name__ == "__main__":
-    carpeta_prueba = Path("./data")
-    if carpeta_prueba.exists():
-        res = sincronizar_directorio(carpeta_prueba, region="mexico")
-        print(f"Resultado de sincronización: {res}")

@@ -2,11 +2,11 @@
 import os
 import sys
 import threading
-from typing import List, Dict, Optional, Union
+from typing import List, Dict, Optional, Union, Tuple
 from pathlib import Path
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
-from FlagEmbedding import BGEM3FlagModel
+from FlagEmbedding import BGEM3FlagModel, FlagReranker
 from backend.config import settings
 
 DIMENSION_BGE_M3 = 1024
@@ -15,6 +15,7 @@ _lock_modelos = threading.Lock()
 
 _qdrant_client: Optional[QdrantClient] = None
 _bge_m3_model: Optional[BGEM3FlagModel] = None
+_reranker_model: Optional[FlagReranker] = None
 
 
 def get_embedding_model() -> BGEM3FlagModel:
@@ -31,10 +32,9 @@ def get_embedding_model() -> BGEM3FlagModel:
                 dispositivo = "cpu"
 
             ruta_local = Path(settings.dense_model_path)
-            modelo_origen = str(ruta_local) if (
-                        ruta_local.exists() and any(ruta_local.iterdir())) else settings.EMBEDDING_MODEL_NAME
+            modelo_origen = str(ruta_local) if (ruta_local.exists() and any(ruta_local.iterdir())) else settings.EMBEDDING_MODEL_NAME
 
-            print(f"[INFO EMBEDDINGS] Inicializando BGE-M3 (Dense Only) en: {dispositivo.upper()}")
+            print(f"[INFO EMBEDDINGS] Inicializando BGE-M3 (Dense + Sparse) en: {dispositivo.upper()}")
 
             _bge_m3_model = BGEM3FlagModel(
                 modelo_origen,
@@ -44,12 +44,27 @@ def get_embedding_model() -> BGEM3FlagModel:
     return _bge_m3_model
 
 
-def get_sparse_model():
-    return None
+def get_reranker_model() -> FlagReranker:
+    global _reranker_model
+    with _lock_modelos:
+        if _reranker_model is None:
+            import torch
 
+            if torch.cuda.is_available():
+                dispositivo = "cuda"
+            else:
+                dispositivo = "cpu"
 
-def get_reranker_model():
-    return None
+            ruta_local = Path(settings.reranker_model_path)
+            modelo_origen = str(ruta_local) if (ruta_local.exists() and any(ruta_local.iterdir())) else settings.RERANKER_MODEL_NAME
+
+            print(f"[INFO RERANKER] Inicializando BGE-Reranker-v2-m3 en: {dispositivo.upper()}")
+
+            _reranker_model = FlagReranker(
+                modelo_origen,
+                use_fp16=(dispositivo == "cuda")
+            )
+    return _reranker_model
 
 
 def get_qdrant_client() -> QdrantClient:
@@ -70,16 +85,24 @@ def _inicializar_coleccion(client: QdrantClient):
                     size=DIMENSION_BGE_M3,
                     distance=models.Distance.COSINE
                 )
+            },
+            sparse_vectors_config={
+                "sparse": models.SparseVectorParams(
+                    modifier=models.Modifier.IDF
+                )
             }
-            # --- MODO DISPERSO COMENTADO ---
-            # , sparse_vectors_config={
-            #     "sparse": models.SparseVectorParams(
-            #         index=models.SparseIndexParams(
-            #             on_disk=False,
-            #         )
-            #     )
-            # }
         )
+        print(f"[INFO QDRANT] Colección '{settings.QDRANT_COLLECTION_NAME}' creada con soporte híbrido (Dense + Sparse).")
+
+
+def formatear_vector_disperso(diccionario_pesos: Dict[Union[str, int], float]) -> models.SparseVector:
+    """Convierte el diccionario léxico de BGE-M3 {token_id: peso} al modelo SparseVector de Qdrant."""
+    indices = []
+    valores = []
+    for token_id, peso in diccionario_pesos.items():
+        indices.append(int(token_id))
+        valores.append(float(peso))
+    return models.SparseVector(indices=indices, values=valores)
 
 
 def buscar_fragmentos(
@@ -87,13 +110,14 @@ def buscar_fragmentos(
         consulta_referencia: Optional[str] = None,
         region: str = "mexico",
         top_k: int = 6,
-        recall_k: int = 12,
+        recall_k: int = 15,
         max_por_doc: int = 3,
         max_por_pagina: int = 2
 ) -> List[Dict]:
     try:
         client = get_qdrant_client()
-        modelo = get_embedding_model()
+        modelo_embeddings = get_embedding_model()
+        modelo_reranker = get_reranker_model()
 
         if isinstance(consultas, str):
             lista_consultas = [consultas]
@@ -103,6 +127,9 @@ def buscar_fragmentos(
         subconsultas_validas = [q.strip() for q in lista_consultas if q.strip()]
         if not subconsultas_validas:
             return []
+
+        # Consulta que evaluará el Reranker al final (la pregunta original del usuario)
+        query_para_rerank = consulta_referencia.strip() if consulta_referencia and consulta_referencia.strip() else subconsultas_validas[0]
 
         filtro_region = models.Filter(
             must=[
@@ -115,75 +142,102 @@ def buscar_fragmentos(
 
         prefetches: List[models.Prefetch] = []
 
-        for sub_query in subconsultas_validas:
-            # return_sparse=False para evitar cómputo innecesario
-            salida = modelo.encode([sub_query], return_dense=True, return_sparse=False)
-            v_denso = salida["dense_vecs"][0].tolist()
+        # Inferencia híbrida BGE-M3 (denso y disperso en una sola pasada)
+        salida_lote = modelo_embeddings.encode(
+            subconsultas_validas,
+            batch_size=len(subconsultas_validas),
+            return_dense=True,
+            return_sparse=True
+        )
 
-            # --- MODO DISPERSO COMENTADO ---
-            # lexical_dict = salida["lexical_weights"][0]
-            # indices_sparse = [int(k) for k in lexical_dict.keys()]
-            # values_sparse = [float(v) for v in lexical_dict.values()]
+        vectores_densos = salida_lote["dense_vecs"]
+        vectores_dispersos = salida_lote["lexical_weights"]
 
+        for idx in range(len(subconsultas_validas)):
+            v_denso = vectores_densos[idx].tolist()
+            v_disperso = formatear_vector_disperso(vectores_dispersos[idx])
+
+            # Prefetch de canal denso (semántica)
             prefetches.append(
                 models.Prefetch(
                     query=v_denso,
                     using="dense",
-                    limit=recall_k * 2,
+                    limit=recall_k,
                     filter=filtro_region
                 )
             )
 
-            # --- MODO DISPERSO COMENTADO ---
-            # if indices_sparse:
-            #     prefetches.append(
-            #         models.Prefetch(
-            #             query=models.SparseVector(
-            #                 indices=indices_sparse,
-            #                 values=values_sparse
-            #             ),
-            #             using="sparse",
-            #             limit=recall_k * 2,
-            #             filter=filtro_region
-            #         )
-            #     )
-
-        # Optimización: Búsqueda directa sin RRF si es una sola consulta
-        if len(prefetches) == 1:
-            respuesta = client.query_points(
-                collection_name=settings.QDRANT_COLLECTION_NAME,
-                query=prefetches[0].query,
-                using="dense",
-                query_filter=filtro_region,
-                limit=top_k * 3,
-                with_payload=True
-            )
-        else:
-            respuesta = client.query_points(
-                collection_name=settings.QDRANT_COLLECTION_NAME,
-                prefetch=prefetches,
-                query=models.FusionQuery(fusion=models.Fusion.RRF),
-                query_filter=filtro_region,
-                limit=top_k * 3,
-                with_payload=True
+            # Prefetch de canal disperso (léxico exacto)
+            prefetches.append(
+                models.Prefetch(
+                    query=v_disperso,
+                    using="sparse",
+                    limit=recall_k,
+                    filter=filtro_region
+                )
             )
 
-        puntos_fusionados = respuesta.points or []
-        if not puntos_fusionados:
+        # Fusión híbrida con RRF (Reciprocal Rank Fusion) en Qdrant
+        respuesta = client.query_points(
+            collection_name=settings.QDRANT_COLLECTION_NAME,
+            prefetch=prefetches,
+            query=models.FusionQuery(fusion=models.Fusion.RRF),
+            query_filter=filtro_region,
+            limit=settings.TOP_K_PREFETCH,
+            with_payload=True
+        )
+
+        puntos_recuperados = respuesta.points or []
+        if not puntos_recuperados:
             return []
 
-        candidatos_finales = []
-        conteo_doc: Dict[str, int] = {}
-        conteo_pag: Dict[str, int] = {}
+        # Deduplicación y filtro por documento/página previo al reranking
+        candidatos_para_rerank = []
         ids_vistos = set()
 
-        for p in puntos_fusionados:
+        for p in puntos_recuperados:
             if p.id in ids_vistos:
                 continue
 
             pl = p.payload or {}
-            doc = str(pl.get("documento", "Desconocido"))
-            pag = str(pl.get("pagina", "N/A"))
+            candidatos_para_rerank.append({
+                "id": p.id,
+                "documento": str(pl.get("documento", "Desconocido")),
+                "ruta_relativa": pl.get("ruta_relativa", ""),
+                "pagina": pl.get("pagina", "N/A"),
+                "contenido": pl.get("contenido", ""),
+                "region": pl.get("region", region),
+                "rrf_score": float(p.score)
+            })
+            ids_vistos.add(p.id)
+
+        if not candidatos_para_rerank:
+            return []
+
+        # ==========================================
+        # ETAPA 2: RE-RANKING CRUZADO (CROSS-ENCODER)
+        # ==========================================
+        pares_rerank = [[query_para_rerank, c["contenido"]] for c in candidatos_para_rerank]
+        scores_rerank = modelo_reranker.compute_score(pares_rerank, normalize=True)
+
+        # Si hay un solo candidato, compute_score devuelve un float plano
+        if isinstance(scores_rerank, (float, int)):
+            scores_rerank = [float(scores_rerank)]
+
+        for i, score in enumerate(scores_rerank):
+            candidatos_para_rerank[i]["score"] = float(score)
+
+        # Ordenar de mayor a menor relevancia semántica cruzada
+        candidatos_ordenados = sorted(candidatos_para_rerank, key=lambda x: x["score"], reverse=True)
+
+        # Filtrar por diversidad de página y documento
+        candidatos_finales = []
+        conteo_doc: Dict[str, int] = {}
+        conteo_pag: Dict[str, int] = {}
+
+        for c in candidatos_ordenados:
+            doc = c["documento"]
+            pag = str(c["pagina"])
             clave_pag = f"{doc}_{pag}"
 
             if conteo_pag.get(clave_pag, 0) >= max_por_pagina:
@@ -191,18 +245,10 @@ def buscar_fragmentos(
             if conteo_doc.get(doc, 0) >= max_por_doc:
                 continue
 
-            ids_vistos.add(p.id)
             conteo_pag[clave_pag] = conteo_pag.get(clave_pag, 0) + 1
             conteo_doc[doc] = conteo_doc.get(doc, 0) + 1
 
-            candidatos_finales.append({
-                "documento": doc,
-                "ruta_relativa": pl.get("ruta_relativa", ""),
-                "pagina": pl.get("pagina", "N/A"),
-                "contenido": pl.get("contenido", ""),
-                "region": pl.get("region", region),
-                "score": float(p.score)
-            })
+            candidatos_finales.append(c)
 
             if len(candidatos_finales) >= top_k:
                 break
@@ -210,7 +256,7 @@ def buscar_fragmentos(
         return candidatos_finales
 
     except Exception as e:
-        print(f"[ERROR BÚSQUEDA QDRANT DENSA BGE-M3] {e}")
+        print(f"[ERROR BÚSQUEDA HÍBRIDA + RERANK] {e}")
         return []
 
 
@@ -243,9 +289,10 @@ def indexar_chunks_documento(puntos: List[models.PointStruct]):
 
 def precargar_modelos_en_segundo_plano():
     try:
-        print("\n[WARM-UP] Iniciando precarga silenciosa de BGE-M3 (Dense Only)...")
+        print("\n[WARM-UP] Iniciando precarga silenciosa de BGE-M3 (Híbrido) y Reranker...")
         get_embedding_model()
+        get_reranker_model()
         get_qdrant_client()
-        print("[WARM-UP] BGE-M3 precargado exitosamente. Listo.\n")
+        print("[WARM-UP] Modelos de búsqueda híbrida y reranking precargados exitosamente.\n")
     except Exception as e:
         print(f"[WARM-UP WARN] Error en precarga: {e}")

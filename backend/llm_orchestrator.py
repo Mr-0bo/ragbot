@@ -2,7 +2,7 @@
 import re
 import asyncio
 import numpy as np
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, AsyncGenerator
 from google import genai
 from google.genai import types
 
@@ -14,6 +14,7 @@ _client: Optional[genai.Client] = None
 # Configuración de referencias para clasificación conversacional local
 PATRON_CORTESIAS = re.compile(
     r'\b(hola|buenos\s+d[ií]as|buenas\s+(tardes|noches)|qu[eé]\s+tal|c[oó]mo\s+est[aá]s|'
+    r'c[oó]mo\s+te\s+va|qu[eé]\s+hay|qu[eé]\s+onda|'
     r'muchas\s+gracias|gracias|de\s+acuerdo|ok|entendido|perfecto|excelente|vale|'
     r'por\s+tu\s+ayuda|hasta\s+luego|adi[oó]s|nos\s+vemos)\b',
     re.IGNORECASE
@@ -21,7 +22,10 @@ PATRON_CORTESIAS = re.compile(
 
 _FRASES_CONVERSACIONALES_REF = [
     "hola, ¿cómo estás?",
+    "¿qué tal todo?",
     "buenos días a todos",
+    "buenas tardes",
+    "¿cómo te va el día de hoy?",
     "muchas gracias por tu ayuda",
     "de acuerdo, entendido, gracias",
     "hasta luego, que tengas buen día",
@@ -39,13 +43,29 @@ def get_gemini_client() -> genai.Client:
     return _client
 
 
+def _extraer_vector_denso(texto: str) -> np.ndarray:
+    """Extrae el vector denso unidimensional evitando el retorno de diccionarios en BGE-M3."""
+    modelo = get_embedding_model()
+    salida = modelo.encode(texto, return_dense=True, return_sparse=False)
+
+    if isinstance(salida, dict) and "dense_vecs" in salida:
+        vec = salida["dense_vecs"]
+    else:
+        vec = salida
+
+    arr = np.array(vec, dtype=np.float32)
+    if arr.ndim > 1:
+        arr = arr[0]
+    return arr
+
+
 def _get_vectores_conversacionales():
+    """Cachea los vectores conversacionales normalizados en RAM."""
     global _VECTORES_CONV_REF
     if _VECTORES_CONV_REF is None:
-        modelo = get_embedding_model()
         vectores = []
         for frase in _FRASES_CONVERSACIONALES_REF:
-            vec = np.array(modelo.encode(frase), dtype=np.float32)
+            vec = _extraer_vector_denso(frase)
             norm = np.linalg.norm(vec)
             if norm > 0:
                 vec = vec / norm
@@ -54,13 +74,12 @@ def _get_vectores_conversacionales():
     return _VECTORES_CONV_REF
 
 
-def clasificar_intencion(mensaje: str) -> str:
-    """Clasifica la intención limpiando primero letras repetidas en saludos comunes."""
+async def clasificar_intencion_async(mensaje: str) -> str:
+    """Clasifica la intención sin bloquear el Event Loop principal de FastAPI."""
     msg_limpio = mensaje.strip().lower()
     if not msg_limpio:
         return "CONVERSACIONAL"
 
-    # 1. Limpieza de puntuación y letras estiradas (ej. holaaaaa -> hola)
     texto_sin_puntuacion = re.sub(r'[^\w\s]', '', msg_limpio)
     texto_sin_puntuacion = re.sub(r'h+o+l+a+', 'hola', texto_sin_puntuacion)
     texto_sin_puntuacion = re.sub(r'b+u+e+n+a+s+', 'buenas', texto_sin_puntuacion)
@@ -74,18 +93,17 @@ def clasificar_intencion(mensaje: str) -> str:
     if len(palabras_residuo) >= 4:
         return "TECNICA"
 
-    # 2. Evaluación semántica
     try:
-        modelo = get_embedding_model()
-        vec_raw = np.array(modelo.encode(msg_limpio), dtype=np.float32)
+        vec_raw = await asyncio.to_thread(_extraer_vector_denso, msg_limpio)
         norm_pregunta = np.linalg.norm(vec_raw)
 
         if norm_pregunta > 0:
             vec_pregunta = vec_raw / norm_pregunta
             vectores_ref = _get_vectores_conversacionales()
-            max_sim = max(float(np.dot(vec_pregunta, v)) for v in vectores_ref)
+            similitudes = [float(np.dot(vec_pregunta, v)) for v in vectores_ref]
+            max_sim = max(similitudes) if similitudes else 0.0
 
-            if max_sim >= 0.65:
+            if max_sim >= 0.62:
                 return "CONVERSACIONAL"
     except Exception as e:
         print(f"[WARN CLASIFICADOR LOCAL] Fallo al calcular similitud: {e}")
@@ -116,7 +134,7 @@ Reglas:
 """
 
     try:
-        modelo_rewrite = getattr(settings, "GEMINI_MODEL_REWRITE", "gemini-3.1-flash-lite")
+        modelo_rewrite = getattr(settings, "GEMINI_MODEL_REWRITE", "gemini-2.5-flash")
         respuesta = await client.aio.models.generate_content(
             model=modelo_rewrite,
             contents=prompt,
@@ -134,9 +152,12 @@ Reglas:
         return [pregunta_actual]
 
 
-async def generar_respuesta_chat_async(system_prompt: str, user_prompt: str,
-                                       historial: Optional[List[Dict]] = None) -> str:
-    """Implementa AsyncChat de Gemini para resolver la advertencia de Google SDK."""
+async def generar_respuesta_chat_stream_async(
+        system_prompt: str,
+        user_prompt: str,
+        historial: Optional[List[Dict]] = None
+) -> AsyncGenerator[str, None]:
+    """Transmite la respuesta palabra por palabra token a token desde Gemini."""
     try:
         client = get_gemini_client()
         history_contents = []
@@ -151,9 +172,8 @@ async def generar_respuesta_chat_async(system_prompt: str, user_prompt: str,
                     )
                 )
 
-        modelo_synthesis = getattr(settings, "GEMINI_MODEL_SYNTHESIS", "gemini-3.5-flash-lite")
+        modelo_synthesis = getattr(settings, "GEMINI_MODEL_SYNTHESIS", "gemini-2.5-flash")
 
-        # Inicializamos la sesión de chat con el historial
         chat = client.aio.chats.create(
             model=modelo_synthesis,
             config=types.GenerateContentConfig(
@@ -163,9 +183,19 @@ async def generar_respuesta_chat_async(system_prompt: str, user_prompt: str,
             history=history_contents
         )
 
-        # Enviamos solo el prompt actual
-        respuesta = await chat.send_message(user_prompt)
-        return respuesta.text if respuesta.text else "No se obtuvo respuesta del modelo."
+        async for chunk in await chat.send_message_stream(user_prompt):
+            if chunk.text:
+                yield chunk.text
+
     except Exception as e:
-        print(f"[ERROR GEMINI CHAT ASYNC] {e}")
-        return "Hubo un inconveniente al comunicarse con el motor de IA. Inténtalo nuevamente."
+        print(f"[ERROR GEMINI STREAMING] {e}")
+        yield f"\n\n[Inconveniente de comunicación con el motor de IA: {e}]"
+
+
+async def generar_respuesta_chat_async(system_prompt: str, user_prompt: str,
+                                       historial: Optional[List[Dict]] = None) -> str:
+    """Fallback síncrono completo."""
+    buffer = []
+    async for chunk in generar_respuesta_chat_stream_async(system_prompt, user_prompt, historial):
+        buffer.append(chunk)
+    return "".join(buffer)
