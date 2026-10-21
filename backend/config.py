@@ -1,16 +1,25 @@
 # backend/config.py
 import os
 from pathlib import Path
+from typing import Optional
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
 
 def get_base_dir() -> Path:
     """Retorna la ruta base del proyecto (raíz del servidor)."""
     return Path(__file__).resolve().parent.parent
 
+
 class Settings(BaseSettings):
-    GEMINI_API_KEY: str
-    GEMINI_MODEL_SYNTHESIS: str = "gemini-3.5-flash-lite"
-    GEMINI_MODEL_REWRITE: str = "gemini-3.1-flash-lite"
+    # LLM Engine Selector: "local" (Gemma vía Ollama/llama.cpp) o "gemini"
+    LLM_PROVIDER: str = "local"
+    LOCAL_LLM_URL: str = "http://127.0.0.1:11434/v1"
+    LOCAL_LLM_MODEL: str = "gemma2:2b"
+
+    # Gemini (opcional para ejecución 100% offline)
+    GEMINI_API_KEY: Optional[str] = None
+    GEMINI_MODEL_SYNTHESIS: str = "gemini-2.5-flash"
+    GEMINI_MODEL_REWRITE: str = "gemini-2.5-flash"
 
     @property
     def GEMINI_MODEL(self) -> str:

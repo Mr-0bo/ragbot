@@ -3,13 +3,13 @@ import re
 import asyncio
 import numpy as np
 from typing import List, Dict, Optional, AsyncGenerator
-from google import genai
-from google.genai import types
+from openai import AsyncOpenAI
 
 from backend.config import settings
 from backend.search_service import get_embedding_model
 
-_client: Optional[genai.Client] = None
+_local_client: Optional[AsyncOpenAI] = None
+_gemini_client = None
 
 # Configuración de referencias para clasificación conversacional local
 PATRON_CORTESIAS = re.compile(
@@ -34,17 +34,30 @@ _FRASES_CONVERSACIONALES_REF = [
 _VECTORES_CONV_REF = None
 
 
-def get_gemini_client() -> genai.Client:
-    global _client
-    if _client is None:
+def get_local_client() -> AsyncOpenAI:
+    global _local_client
+    if _local_client is None:
+        url = getattr(settings, "LOCAL_LLM_URL", "http://127.0.0.1:11434/v1")
+        _local_client = AsyncOpenAI(
+            base_url=url,
+            api_key="local-token",
+            timeout=60.0
+        )
+    return _local_client
+
+
+def get_gemini_client():
+    global _gemini_client
+    if _gemini_client is None:
+        from google import genai
         if not settings or not settings.GEMINI_API_KEY:
             raise ValueError("GEMINI_API_KEY no está configurada en las variables de entorno.")
-        _client = genai.Client(api_key=settings.GEMINI_API_KEY)
-    return _client
+        _gemini_client = genai.Client(api_key=settings.GEMINI_API_KEY)
+    return _gemini_client
 
 
 def _extraer_vector_denso(texto: str) -> np.ndarray:
-    """Extrae el vector denso unidimensional evitando el retorno de diccionarios en BGE-M3."""
+    """Extrae el vector denso unidimensional evitando diccionarios en BGE-M3."""
     modelo = get_embedding_model()
     salida = modelo.encode(texto, return_dense=True, return_sparse=False)
 
@@ -112,32 +125,55 @@ async def clasificar_intencion_async(mensaje: str) -> str:
 
 
 async def reformular_pregunta_con_historial_async(historial_mensajes: List[Dict], pregunta_actual: str) -> List[str]:
-    client = get_gemini_client()
+    """Reformula preguntas para búsqueda vectorial usando Gemma local."""
+    provider = getattr(settings, "LLM_PROVIDER", "local").lower()
 
     historial_contexto = ""
     if historial_mensajes:
         ultimos_turnos = historial_mensajes[-3:]
-        historial_contexto = "Historial reciente de conversación:\n" + "\n".join(
+        historial_contexto = "Historial reciente:\n" + "\n".join(
             [f"{m['rol'].upper()}: {m['contenido']}" for m in ultimos_turnos]
         ) + "\n\n"
 
-    prompt = f"""Eres un optimizador de búsquedas vectoriales para documentación técnica y normativa.
-Tu objetivo es analizar la última pregunta del usuario y convertirla en consultas directas y efectivas.
+    system_prompt = (
+        "Eres un optimizador de búsquedas vectoriales técnicas. "
+        "Analiza la pregunta del usuario y el historial previo. "
+        "Genera una o varias subconsultas técnicas directas, una por línea. "
+        "No agregues numeración, viñetas, guiones ni texto explicativo."
+    )
+    user_prompt = f"{historial_contexto}Pregunta actual: {pregunta_actual}\nSubconsultas:"
 
-Reglas:
-1. Resuelve pronombres, términos ambiguos o temas implícitos usando el historial previo.
-2. Si la pregunta plantea dos o más aspectos técnicos distintos, sepárala en subconsultas independientes, una por línea.
-3. Para conceptos normativos, procesos o especificaciones, genera consultas concisas basadas en palabras clave técnicas esenciales.
-4. Responde ÚNICAMENTE con las consultas resultantes (una por línea), sin numeración, viñetas, guiones ni texto adicional.
+    if provider == "local":
+        try:
+            client = get_local_client()
+            modelo = getattr(settings, "LOCAL_LLM_MODEL", "gemma2:2b")
+            respuesta = await client.chat.completions.create(
+                model=modelo,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=0.0
+            )
+            texto_salida = respuesta.choices[0].message.content.strip() if respuesta.choices else ""
+            subconsultas = [
+                re.sub(r'^[0-9\.\-\*\s]+', '', linea).strip()
+                for linea in texto_salida.split("\n")
+                if linea.strip()
+            ]
+            return subconsultas if subconsultas else [pregunta_actual]
+        except Exception as e:
+            print(f"[WARN REFORMULACIÓN GEMMA LOCAL] Error: {e}")
+            return [pregunta_actual]
 
-{historial_contexto}Pregunta actual: {pregunta_actual}
-"""
-
+    # Fallback Gemini Cloud
     try:
+        from google.genai import types
+        client = get_gemini_client()
         modelo_rewrite = getattr(settings, "GEMINI_MODEL_REWRITE", "gemini-2.5-flash")
         respuesta = await client.aio.models.generate_content(
             model=modelo_rewrite,
-            contents=prompt,
+            contents=f"{system_prompt}\n\n{user_prompt}",
             config=types.GenerateContentConfig(temperature=0.0)
         )
         texto_salida = respuesta.text.strip() if respuesta.text else ""
@@ -157,8 +193,40 @@ async def generar_respuesta_chat_stream_async(
         user_prompt: str,
         historial: Optional[List[Dict]] = None
 ) -> AsyncGenerator[str, None]:
-    """Transmite la respuesta palabra por palabra token a token desde Gemini."""
+    """Transmite la respuesta palabra por palabra token a token desde Gemma (local) o Gemini."""
+    provider = getattr(settings, "LLM_PROVIDER", "local").lower()
+
+    if provider == "local":
+        try:
+            client = get_local_client()
+            modelo = getattr(settings, "LOCAL_LLM_MODEL", "gemma2:2b")
+
+            mensajes = [{"role": "system", "content": system_prompt}]
+            if historial:
+                for h in historial:
+                    rol = "assistant" if h["rol"] in ("assistant", "model") else "user"
+                    mensajes.append({"role": rol, "content": h["contenido"]})
+            mensajes.append({"role": "user", "content": user_prompt})
+
+            stream = await client.chat.completions.create(
+                model=modelo,
+                messages=mensajes,
+                temperature=0.1,
+                stream=True
+            )
+
+            async for chunk in stream:
+                if chunk.choices and chunk.choices[0].delta.content:
+                    yield chunk.choices[0].delta.content
+
+        except Exception as e:
+            print(f"[ERROR GEMMA STREAMING LOCAL] {e}")
+            yield f"\n\n[Inconveniente en inferencia local con Gemma: {e}]"
+        return
+
+    # Fallback Gemini Cloud
     try:
+        from google.genai import types
         client = get_gemini_client()
         history_contents = []
 
@@ -173,7 +241,6 @@ async def generar_respuesta_chat_stream_async(
                 )
 
         modelo_synthesis = getattr(settings, "GEMINI_MODEL_SYNTHESIS", "gemini-2.5-flash")
-
         chat = client.aio.chats.create(
             model=modelo_synthesis,
             config=types.GenerateContentConfig(

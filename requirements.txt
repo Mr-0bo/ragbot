@@ -24,6 +24,7 @@ SQLAlchemy
 # ==========================================
 # 🧠 INTELIGENCIA ARTIFICIAL Y LLMs
 # ==========================================
+openai
 google-genai
 
 # ==========================================
@@ -37,9 +38,6 @@ FlagEmbedding
 # ==========================================
 pymupdf
 pillow
-# paddleocr y paddlepaddle solo si vas a requerir OCR en imágenes escaneadas
-# paddleocr
-# paddlepaddle
 
 # ==========================================
 # 🛠️ UTILIDADES DEL SISTEMA
