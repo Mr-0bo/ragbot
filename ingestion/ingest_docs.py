@@ -125,6 +125,38 @@ def dividir_en_chunks(
     return chunks_finales
 
 
+def _es_carpeta_obsoleta(ruta_path: Path) -> bool:
+    """
+    Evalúa si la ruta contiene directorios de años o periodos históricos (2005-2024,
+    2023-2024, 2024-2025, etc.) o palabras clave de respaldo.
+    Conserva carpetas con nombres operativos y las carpetas de vigencia actual (2025-2026).
+    """
+    patron_rango = re.compile(r"^(\d{4})\s*[-_–]\s*(\d{4})$")
+
+    for parte in ruta_path.parts[:-1]:
+        limpio = parte.strip()
+
+        # 1. Año simple de 4 dígitos entre 2005 y 2024
+        if limpio.isdigit() and len(limpio) == 4:
+            año = int(limpio)
+            if 2005 <= año <= 2024:
+                return True
+
+        # 2. Rangos de años (ej. 2023-2024, 2024-2025)
+        match_rango = patron_rango.match(limpio)
+        if match_rango:
+            año_fin = int(match_rango.group(2))
+            if año_fin <= 2025:
+                return True
+
+        # 3. Marcas explícitas de archivo histórico
+        limpio_upper = limpio.upper()
+        if any(h in limpio_upper for h in ["HISTORICOS", "HISTÓRICOS", "OBSOLETOS"]):
+            return True
+
+    return False
+
+
 def auditar_directorio(directorio_raiz: Path, region: str = "mexico") -> dict:
     db = SessionLocal()
     try:
@@ -140,6 +172,10 @@ def auditar_directorio(directorio_raiz: Path, region: str = "mexico") -> dict:
 
         for pdf in directorio_raiz.rglob("*.pdf"):
             if not pdf.is_file() or pdf.name.startswith("._") or pdf.name.startswith("~"):
+                continue
+
+            # Descartar archivos ubicados en carpetas de años obsoletos
+            if _es_carpeta_obsoleta(pdf):
                 continue
 
             ruta_abs = str(pdf.resolve())
@@ -213,7 +249,6 @@ def procesar_e_indexar_archivo(
     except Exception as e:
         print(f"[WARN QDRANT] Error limpiando vectores antiguos de '{ruta_pdf.name}': {e}", flush=True)
 
-    # Lote prudente para tarjetas de 4 GB
     lote_size = 12
     puntos_qdrant = []
 
@@ -259,7 +294,6 @@ def procesar_e_indexar_archivo(
     except Exception as e:
         print(f"[ERROR QDRANT] Falló la inserción en Qdrant para '{ruta_pdf.name}': {e}", flush=True)
 
-    # Limpieza inmediata de listas de chunks para liberar memoria RAM
     del puntos_qdrant
     del textos_chunk
     del metadatos_chunk
@@ -297,7 +331,6 @@ def procesar_e_indexar_archivo(
         print(f"[ERROR DB] Falló al registrar metadatos de '{ruta_pdf.name}': {e}", flush=True)
     finally:
         db.close()
-        # Vaciado riguroso de memoria tras finalizar cada documento
         liberar_memoria()
 
     return total_chunks
