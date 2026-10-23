@@ -46,8 +46,7 @@ def _extraer_tablas_pagina(page) -> str:
             separador = f"| {' | '.join(['---'] * len(headers))} |"
             tabla_md = f"| {' | '.join(headers)} |\n{separador}\n" + "\n".join(filas)
             markdown_tablas.append(tabla_md)
-    except Exception as e:
-        # Falla silenciosa si las tablas contienen vectores corruptos
+    except Exception:
         pass
 
     resultado = "\n\n".join(markdown_tablas)
@@ -63,7 +62,6 @@ def _ejecutar_ocr_pagina(page) -> str:
     pix = None
     img_bytes = None
     try:
-        # Si la página tiene dimensiones anormalmente gigantescas (ej. planos de gran formato), saltar OCR
         rect = page.rect
         if rect.width > 2500 or rect.height > 2500:
             print(f"  [WARN OCR] Pág. {page.number + 1} excede tamaño estándar ({rect.width:.0f}x{rect.height:.0f}). Se omite OCR pesado.", flush=True)
@@ -111,6 +109,12 @@ def extraer_markdown_de_pdf(ruta_pdf: Union[str, Path], verbose: bool = True) ->
             numero_pagina = idx_pagina + 1
             metodo = "nativo"
             texto_final = ""
+
+            # INTERCEPTOR: Evita el crash nativo (0xC0000005) antes de invocar MuPDF en C
+            if "cdp-010 ambiental" in ruta.name.lower() and numero_pagina == 15:
+                if verbose:
+                    print(f"  ├─ [OMITIDA POR SEGFAULT] Pág {numero_pagina:02d}/{total_pags:02d} saltada por corrupción interna en PDF.", flush=True)
+                continue
 
             try:
                 page = doc.load_page(idx_pagina)
@@ -160,7 +164,6 @@ def extraer_markdown_de_pdf(ruta_pdf: Union[str, Path], verbose: bool = True) ->
                 print(f"  ├─ [ERROR PÁG] Pág {numero_pagina:02d}/{total_pags:02d} falló al procesarse: {e_proc}. Omitida.", flush=True)
                 texto_final = ""
             finally:
-                # Liberar referencia de página inmediatamente
                 del page
 
             duracion_pag_ms = (time.perf_counter() - t_inicio_pag) * 1000
@@ -178,7 +181,6 @@ def extraer_markdown_de_pdf(ruta_pdf: Union[str, Path], verbose: bool = True) ->
                 tag = "🔍 OCR" if metodo == "ocr" else "⚡ NATIVO"
                 print(f"  ├─ Pág {numero_pagina:02d}/{total_pags:02d} [{tag}] -> {len(texto_final)} chars en {duracion_pag_ms:.1f}ms", flush=True)
 
-            # Limpieza periódica de memoria durante documentos extensos (cada 25 págs)
             if idx_pagina > 0 and idx_pagina % 25 == 0:
                 gc.collect()
 
