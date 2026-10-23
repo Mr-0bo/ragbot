@@ -1,4 +1,5 @@
 # ingestion/ingest_docs.py
+import gc
 import os
 import re
 import time
@@ -7,6 +8,13 @@ import hashlib
 from pathlib import Path
 from typing import Callable, Optional, List
 from qdrant_client.http import models
+
+# Import condicional de PyTorch para vaciado de caché VRAM
+try:
+    import torch
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
 
 from backend.config import settings
 from backend.database import SessionLocal, DocumentoNormativo
@@ -17,6 +25,13 @@ from backend.search_service import (
     get_embedding_model,
     formatear_vector_disperso
 )
+
+
+def liberar_memoria():
+    """Fuerza la recolección de basura del sistema y vacía el búfer de VRAM en CUDA."""
+    gc.collect()
+    if HAS_TORCH and torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def calcular_hash_md5(ruta_archivo: Path) -> str:
@@ -161,7 +176,13 @@ def procesar_e_indexar_archivo(
         region: str,
         embedding_model
 ) -> int:
-    paginas = extraer_markdown_de_pdf(ruta_pdf, verbose=False)
+    try:
+        paginas = extraer_markdown_de_pdf(ruta_pdf, verbose=False)
+    except Exception as e:
+        print(f"[ERROR PARSER] Error general extrayendo '{ruta_pdf.name}': {e}", flush=True)
+        liberar_memoria()
+        return 0
+
     total_chunks = 0
     textos_chunk = []
     metadatos_chunk = []
@@ -183,12 +204,16 @@ def procesar_e_indexar_archivo(
             })
 
     if not textos_chunk:
+        liberar_memoria()
         return 0
 
     # Limpiar vectores previos del archivo
-    eliminar_documento_por_ruta(ruta_abs)
+    try:
+        eliminar_documento_por_ruta(ruta_abs)
+    except Exception as e:
+        print(f"[WARN QDRANT] Error limpiando vectores antiguos de '{ruta_pdf.name}': {e}", flush=True)
 
-    # Lote óptimo para inferencia híbrida
+    # Lote prudente para tarjetas de 4 GB
     lote_size = 12
     puntos_qdrant = []
 
@@ -229,7 +254,15 @@ def procesar_e_indexar_archivo(
                 )
             )
 
-    indexar_chunks_documento(puntos_qdrant)
+    try:
+        indexar_chunks_documento(puntos_qdrant)
+    except Exception as e:
+        print(f"[ERROR QDRANT] Falló la inserción en Qdrant para '{ruta_pdf.name}': {e}", flush=True)
+
+    # Limpieza inmediata de listas de chunks para liberar memoria RAM
+    del puntos_qdrant
+    del textos_chunk
+    del metadatos_chunk
 
     db = SessionLocal()
     try:
@@ -259,8 +292,13 @@ def procesar_e_indexar_archivo(
             doc.esta_indexado = True
 
         db.commit()
+    except Exception as e:
+        db.rollback()
+        print(f"[ERROR DB] Falló al registrar metadatos de '{ruta_pdf.name}': {e}", flush=True)
     finally:
         db.close()
+        # Vaciado riguroso de memoria tras finalizar cada documento
+        liberar_memoria()
 
     return total_chunks
 
@@ -282,6 +320,9 @@ def sincronizar_directorio(
             eliminar_documento_por_ruta(ruta_abs)
             db.query(DocumentoNormativo).filter(DocumentoNormativo.ruta_absoluta == ruta_abs).delete()
         db.commit()
+    except Exception as e:
+        db.rollback()
+        print(f"[ERROR DB] Error al purgar documentos eliminados: {e}", flush=True)
     finally:
         db.close()
 
@@ -294,8 +335,10 @@ def sincronizar_directorio(
         if callback_progreso:
             callback_progreso(idx, total, pdf.name)
 
+        print(f"\n[SYNC ({idx}/{total})] Procesando: {pdf.name} ...", flush=True)
         chunks = procesar_e_indexar_archivo(pdf, ruta_abs, hash_md5, region, modelo_embedding)
         chunks_totales += chunks
+        print(f"[SYNC ({idx}/{total})] Completado: {pdf.name} ({chunks} chunks)", flush=True)
 
     return {
         "nuevos_procesados": len(auditoria["nuevos"]),
