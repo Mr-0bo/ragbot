@@ -1,4 +1,5 @@
 # backend/search_service.py
+import gc
 import os
 import sys
 import threading
@@ -34,7 +35,7 @@ def get_embedding_model() -> BGEM3FlagModel:
             ruta_local = Path(settings.dense_model_path)
             modelo_origen = str(ruta_local) if (ruta_local.exists() and any(ruta_local.iterdir())) else settings.EMBEDDING_MODEL_NAME
 
-            print(f"[INFO EMBEDDINGS] Inicializando BGE-M3 (Dense + Sparse) en: {dispositivo.upper()}")
+            print(f"[INFO EMBEDDINGS] Inicializando BGE-M3 (Dense + Sparse) en: {dispositivo.upper()}", flush=True)
 
             _bge_m3_model = BGEM3FlagModel(
                 modelo_origen,
@@ -58,7 +59,7 @@ def get_reranker_model() -> FlagReranker:
             ruta_local = Path(settings.reranker_model_path)
             modelo_origen = str(ruta_local) if (ruta_local.exists() and any(ruta_local.iterdir())) else settings.RERANKER_MODEL_NAME
 
-            print(f"[INFO RERANKER] Inicializando BGE-Reranker-v2-m3 en: {dispositivo.upper()}")
+            print(f"[INFO RERANKER] Inicializando BGE-Reranker-v2-m3 en: {dispositivo.upper()}", flush=True)
 
             _reranker_model = FlagReranker(
                 modelo_origen,
@@ -77,22 +78,51 @@ def get_qdrant_client() -> QdrantClient:
 
 
 def _inicializar_coleccion(client: QdrantClient):
+    """
+    Crea o actualiza la colección para que opere obligatoriamente con almacenamiento
+    en disco (on_disk=True), evitando desbordamientos de memoria RAM en local.
+    """
     if not client.collection_exists(settings.QDRANT_COLLECTION_NAME):
         client.create_collection(
             collection_name=settings.QDRANT_COLLECTION_NAME,
             vectors_config={
                 "dense": models.VectorParams(
                     size=DIMENSION_BGE_M3,
-                    distance=models.Distance.COSINE
+                    distance=models.Distance.COSINE,
+                    on_disk=True  # Vectores densos en disco
                 )
             },
             sparse_vectors_config={
                 "sparse": models.SparseVectorParams(
-                    modifier=models.Modifier.IDF
+                    modifier=models.Modifier.IDF,
+                    index=models.SparseIndexParams(
+                        on_disk=True  # Vectores dispersos en disco
+                    )
                 )
-            }
+            },
+            hnsw_config=models.HnswConfigDiff(
+                on_disk=True  # Grafo HNSW en disco
+            ),
+            on_disk_payload=True
         )
-        print(f"[INFO QDRANT] Colección '{settings.QDRANT_COLLECTION_NAME}' creada con soporte híbrido (Dense + Sparse).")
+        print(f"[INFO QDRANT] Colección '{settings.QDRANT_COLLECTION_NAME}' creada en DISCO (Dense + Sparse).", flush=True)
+    else:
+        # Migración dinámica en vivo: si la colección ya existe, forzar vectores e índice a disco
+        try:
+            client.update_collection(
+                collection_name=settings.QDRANT_COLLECTION_NAME,
+                vectors_config={
+                    "dense": models.VectorParamsDiff(on_disk=True)
+                },
+                hnsw_config=models.HnswConfigDiff(on_disk=True),
+                optimizers_config=models.OptimizersConfigDiff(
+                    indexing_threshold=10000,
+                    memmap_threshold=10000
+                )
+            )
+            print(f"[INFO QDRANT] Colección existente '{settings.QDRANT_COLLECTION_NAME}' optimizada a DISCO.", flush=True)
+        except Exception as e:
+            print(f"[WARN QDRANT] No fue necesario o falló actualizar parámetros a disco: {e}", flush=True)
 
 
 def formatear_vector_disperso(diccionario_pesos: Dict[Union[str, int], float]) -> models.SparseVector:
@@ -220,7 +250,6 @@ def buscar_fragmentos(
         pares_rerank = [[query_para_rerank, c["contenido"]] for c in candidatos_para_rerank]
         scores_rerank = modelo_reranker.compute_score(pares_rerank, normalize=True)
 
-        # Si hay un solo candidato, compute_score devuelve un float plano
         if isinstance(scores_rerank, (float, int)):
             scores_rerank = [float(scores_rerank)]
 
@@ -256,8 +285,16 @@ def buscar_fragmentos(
         return candidatos_finales
 
     except Exception as e:
-        print(f"[ERROR BÚSQUEDA HÍBRIDA + RERANK] {e}")
+        print(f"[ERROR BÚSQUEDA HÍBRIDA + RERANK] {e}", flush=True)
         return []
+    finally:
+        # Liberación periódica tras búsquedas intensas
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except ImportError:
+            pass
 
 
 def eliminar_documento_por_ruta(ruta_relativa: str):
@@ -289,10 +326,10 @@ def indexar_chunks_documento(puntos: List[models.PointStruct]):
 
 def precargar_modelos_en_segundo_plano():
     try:
-        print("\n[WARM-UP] Iniciando precarga silenciosa de BGE-M3 (Híbrido) y Reranker...")
+        print("\n[WARM-UP] Iniciando precarga silenciosa de BGE-M3 (Híbrido) y Reranker...", flush=True)
         get_embedding_model()
         get_reranker_model()
         get_qdrant_client()
-        print("[WARM-UP] Modelos de búsqueda híbrida y reranking precargados exitosamente.\n")
+        print("[WARM-UP] Modelos de búsqueda híbrida y reranking precargados exitosamente.\n", flush=True)
     except Exception as e:
-        print(f"[WARM-UP WARN] Error en precarga: {e}")
+        print(f"[WARM-UP WARN] Error en precarga: {e}", flush=True)
